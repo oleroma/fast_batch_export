@@ -571,19 +571,18 @@ def rebuild_ui_cache_if_dirty():
         for c_idx, c in enumerate(p.collections):
             c_ptr = bpy.data.collections.get(c.collection_name)
             sync_collection_objects(c, c_ptr)
-            c_objs, c_exp = len(c.objects), 0
+            c_objs, c_exp = 0, 0
 
             if c_ptr and not visibility.get(c.collection_name, True):
                 c_pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups, "COLLECTION")
                 for obj_prop in c.objects:
-                    p_objs += 1
                     if not obj_prop.export: continue
                     bl_obj = c_ptr.all_objects.get(obj_prop.name)
                     if bl_obj and bl_obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not bl_obj.hide_viewport:
+                        c_objs += 1
+                        p_objs += 1
                         obj_ovrs = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT")
                         c_exp += len(generate_override_combinations(obj_ovrs))
-            else:
-                p_objs += len(c.objects)
 
             p_exp += c_exp
             col_stats[f"{p.name}_c{c_idx}"] = {"objs": c_objs, "exp": c_exp}

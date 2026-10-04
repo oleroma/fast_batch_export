@@ -25,11 +25,17 @@
 - **Direct & Action-First**: Deliver final, production-ready code with concise explanations.
 - **No Filler**: Skip conversational meta-chatter, repetitive apologies, or reciting raw tool output.
 
-## 5. Gemini Flash Optimizations
-- **Zero Preambles**: Omit conversational openers, pleasantries, and transitional filler; start immediately with the action or concise summary.
-- **Single-Turn Resolution**: Complete the end-to-end task in one coherent, deliberate sequence (targeted read -> doc check if needed -> surgical edit) without breaking into multiple unnecessary turns.
-- **Exact String Anchoring**: In `edit_file`, capture sufficient surrounding context in `old_string` to guarantee an unambiguous, first-attempt match against Python indentation.
-- **Grounded Attention**: Confine attention strictly to the targeted components and active diffs; avoid speculative analysis or unrequested refactoring of unrelated logic.
+## 5. Gemini Optimizations
+- **Zero Preambles**: Omit conversational openers, pleasantries, and transitional filler; start immediately with the action or concise technical summary.
+- **Coherent Tool Execution**: Resolve tasks in a single deliberate sequence (targeted read -> doc check if needed -> surgical edit) without breaking into unnecessary turns or fragmented tool calls.
+- **Exact String Anchoring**: In `edit_file`, capture sufficient surrounding context in `old_string` to guarantee an unambiguous, first-attempt match against Python indentation and avoid whitespace drift.
+- **Grounded In-Context Attention**: Confine attention strictly to targeted components and active diffs; avoid speculative analysis, unverified API guesses, or unrequested refactoring of unrelated logic.
+
+## 6. Critical Judgment & Technical Pushback
+- **Do Not Follow Blindly**: Proactively challenge requests that are redundant, degrade export/UI performance, introduce gratuitous complexity, or conflict with Blender 5.2 architecture.
+- **Concisely State Trade-offs**: When pushing back, state the technical bottleneck (e.g., API constraints, undo stack corruption, event loop stalls) and recommend a simpler, superior alternative.
+- **Block Impossible Implementations**: If a request violates Blender's C/Python boundary, data-block ownership model, or operator execution constraints, explain why it cannot work reliably and propose a viable alternative rather than shipping a brittle hack.
+
 
 
 

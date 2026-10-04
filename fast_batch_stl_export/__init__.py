@@ -33,6 +33,39 @@ from bpy.app.handlers import persistent    # A "decorator" that tells Blender to
 # They hold "state" (memory) while the program runs. Dictionaries ({}) hold key-value pairs.
 # ==============================================================================
 
+# Centralized Icon Dictionary for easy UI customization
+ICONS = {
+    'PRESET': 'PRESET',
+    'COLLECTION': 'OUTLINER_COLLECTION',
+    'OBJECT': 'OBJECT_DATA',
+    'SWEEP': 'CON_ROTLIMIT',  # Used for permutation/sweep values
+    'GLOBAL': 'WORLD',
+    'DIR': 'FILE_FOLDER',
+    'TAG': 'BOOKMARKS',
+    'ADD': 'ADD',
+    'DEL': 'TRASH',
+    'UP': 'TRIA_UP',
+    'DOWN': 'TRIA_DOWN',
+    'COPY': 'COPYDOWN',
+    'PASTE': 'PASTEDOWN',
+    'CANCEL': 'CANCEL',
+    'EXPORT': 'EXPORT',
+    'IMPORT': 'IMPORT',
+    'INFO': 'INFO',
+    'CONSOLE': 'CONSOLE',
+    'CHECK_ON': 'CHECKBOX_HLT',
+    'CHECK_OFF': 'CHECKBOX_DEHLT',
+    'OVR': 'DECORATE_OVERRIDE',
+    'NODE': 'NODETREE',
+    'TIME': 'TIME',
+    'MODIFIER': 'MODIFIER',
+    'TREE': 'OUTLINER_OB_EMPTY',
+    'ERROR': 'ERROR',
+    'RIGHT': 'TRIA_RIGHT',
+    'BLANK': 'BLANK1',
+    'FILE': 'FILE_3D'
+}
+
 # Stores copied presets and collections so the user can paste them elsewhere in the UI.
 _clipboard = {
     "preset": None,
@@ -44,8 +77,7 @@ _clipboard = {
 _ui_cache = {
     "is_dirty": True,
     "visibility": {},
-    "metrics": {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0},
-    "active_col_metrics": {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0},
+    "stats": {"global": {"presets": 0, "cols": 0, "objs": 0, "exp": 0}, "presets": {}, "cols": {}},
     "tree": ({}, set()),
     "preset_metrics": {}
 }
@@ -736,13 +768,13 @@ def _get_preset_status(scene, preset):
 # Background timer executes heavy calculation outside of `draw()`
 def rebuild_ui_cache_if_dirty():
     if not _ui_cache.get("is_dirty", False):
-        return 1.0 # Wait 1.0s before checking the dirty flag again to prevent UI lag
+        return 0.1 # Very fast return if no changes were made
 
     _ui_cache["is_dirty"] = False
     context = bpy.context
     if not hasattr(context, "scene"):
         _ui_cache["is_dirty"] = True
-        return 1.0
+        return 0.1
 
     scene = context.scene
 
@@ -751,18 +783,6 @@ def rebuild_ui_cache_if_dirty():
         ho, hp = _get_preset_status(scene, p)
         preset_metrics[p.name] = {"has_ovr": ho, "has_perm": hp}
     _ui_cache["preset_metrics"] = preset_metrics
-
-    # If the info box is closed, bypass heavy object/depsgraph traversal completely
-    if not getattr(scene, "batch_stl_show_console", False):
-        if getattr(context, "window_manager", None):
-            for window in context.window_manager.windows:
-                for area in window.screen.areas:
-                    if area.type == 'VIEW_3D':
-                        area.tag_redraw()
-                        for region in area.regions:
-                            if region.type == 'UI':
-                                region.tag_redraw()
-        return 1.0
 
     # 1. Evaluate explicit visibility to prevent recursive outliner walks on redraw
     visibility = {}
@@ -777,11 +797,60 @@ def rebuild_ui_cache_if_dirty():
     _ui_cache["visibility"] = visibility
 
     preset = get_active_preset(scene)
-    if not preset and not getattr(scene, "batch_stl_info_global", False):
-        _ui_cache["metrics"] = {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0}
-        _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
-        _ui_cache["tree"] = ({}, set())
 
+    # 2. Re-calculate metrics fully decoupled from UI
+    # We always compute full global stats to populate UI counters correctly
+    total_presets = len(scene.batch_stl_presets)
+    g_cols, g_objs, g_exp = 0, 0, 0
+    preset_stats = {}
+    col_stats = {}
+
+    global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
+
+    for p in scene.batch_stl_presets:
+        p_cols = len(p.collections)
+        p_objs = 0
+        p_exp = 0
+        preset_ovrs = global_ovrs + get_flat_overrides(p.nodegroups, "PRESET")
+
+        for c_idx, c in enumerate(p.collections):
+            c_ptr = bpy.data.collections.get(c.collection_name)
+            sync_collection_objects(c, c_ptr)
+
+            c_objs = len(c.objects)
+            c_exp = 0
+
+            if c_ptr and not visibility.get(c.collection_name, True):
+                c_pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups, "COLLECTION")
+                for obj_prop in c.objects:
+                    p_objs += 1
+                    if not obj_prop.export: continue
+                    bl_obj = c_ptr.all_objects.get(obj_prop.name)
+                    if bl_obj and bl_obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not bl_obj.hide_viewport:
+                        obj_ovrs = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT")
+                        combos = len(generate_override_combinations(obj_ovrs))
+                        c_exp += combos
+            else:
+                for obj_prop in c.objects:
+                    p_objs += 1
+
+            p_exp += c_exp
+            col_key = f"{p.name}_c{c_idx}"
+            col_stats[col_key] = {"objs": c_objs, "exp": c_exp}
+
+        g_cols += p_cols
+        g_objs += p_objs
+        g_exp += p_exp
+        preset_stats[p.name] = {"cols": p_cols, "objs": p_objs, "exp": p_exp}
+
+    _ui_cache["stats"] = {
+        "global": {"presets": total_presets, "cols": g_cols, "objs": g_objs, "exp": g_exp},
+        "presets": preset_stats,
+        "cols": col_stats
+    }
+
+    # If the info box is closed, bypass treeview building to save performance
+    if not getattr(scene, "batch_stl_show_console", False):
         if getattr(context, "window_manager", None):
             for window in context.window_manager.windows:
                 for area in window.screen.areas:
@@ -790,77 +859,21 @@ def rebuild_ui_cache_if_dirty():
                         for region in area.regions:
                             if region.type == 'UI':
                                 region.tag_redraw()
-        return 1.0
+        return 0.1
 
-    # 2. Re-calculate metrics fully decoupled from UI
     is_global = getattr(scene, "batch_stl_info_global", False)
-    target_presets = scene.batch_stl_presets if is_global else ([preset] if preset else [])
 
-    total_collections = 0
-    total_objects = 0
-    total_preset_combos = 0
-
-    global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
-
-    for p in target_presets:
-        total_collections += len(p.collections)
-        preset_ovrs = global_ovrs + get_flat_overrides(p.nodegroups, "PRESET")
-
-        for c in p.collections:
-            c_ptr = bpy.data.collections.get(c.collection_name)
-            sync_collection_objects(c, c_ptr)
-
-            if not c_ptr or visibility.get(c.collection_name, True):
-                continue
-
-            c_pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups, "COLLECTION")
-            for obj_prop in c.objects:
-                if not obj_prop.export: continue
-                bl_obj = c_ptr.all_objects.get(obj_prop.name)
-                if bl_obj and bl_obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not bl_obj.hide_viewport:
-                    obj_ovrs = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT")
-                    combos = len(generate_override_combinations(obj_ovrs))
-                    total_preset_combos += combos
-                    total_objects += combos
-
-    _ui_cache["metrics"] = {
-        "total_collections": total_collections,
-        "total_preset_combos": total_preset_combos,
-        "total_objects": total_objects
-    }
-
-    # 3. Active collection metrics pre-computation
-    # This always evaluates based on the currently active preset UI context
-    active_col = get_active_collection(preset)
-    if active_col:
-        active_obj = get_active_object(active_col)
-        # Use active preset's context overrides
-        active_preset_ovrs = global_ovrs + get_flat_overrides(preset.nodegroups, "PRESET") if preset else global_ovrs
-        all_ovrs = active_preset_ovrs + get_flat_overrides(active_col.nodegroups, "COLLECTION") + (get_flat_overrides(active_obj.nodegroups, "OBJECT") if active_obj else [])
-        unique_targets = set()
-        total_inputs = 0
-
-        for o in all_ovrs:
-            group_name = o.parent_group_ptr.name if o.parent_group_ptr else ""
-            total_inputs += len(o.inputs)
-            for i in o.inputs:
-                unique_targets.add((o.override_target, group_name, o.node_name, i.input_name))
-
-        num_targets = len(unique_targets)
-        num_combos = len(generate_override_combinations(all_ovrs))
-
-        active_obj_count = sum(1 for o in active_col.objects if o.export)
-
-        c_name = active_col.collection_name if active_col.collection_name else "Unassigned"
-        if active_col.tag: c_name += f" [{active_col.tag}]"
-
-        _ui_cache["active_col_metrics"] = {
-            "c_name": c_name, "num_targets": num_targets,
-            "total_inputs": total_inputs, "num_combos": num_combos,
-            "mapping_total_objects": active_obj_count * num_combos
-        }
-    else:
-        _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
+    if not preset and not is_global:
+        _ui_cache["tree"] = ({}, set())
+        if getattr(context, "window_manager", None):
+            for window in context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
+                        for region in area.regions:
+                            if region.type == 'UI':
+                                region.tag_redraw()
+        return 0.1
 
     # 4. Build visualization tree across evaluated scope
     tree_dict, duplicates = build_tree_dict(context, visibility, is_global)
@@ -874,7 +887,7 @@ def rebuild_ui_cache_if_dirty():
                     for region in area.regions:
                         if region.type == 'UI':
                             region.tag_redraw()
-    return 1.0
+    return 0.1
 
 @persistent
 def batch_stl_depsgraph_handler(scene, depsgraph):
@@ -1030,7 +1043,7 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
         box = col.box()
         row = box.row()
 
-        icon = 'TRIA_RIGHT' if is_collapsed else 'TRIA_DOWN'
+        icon = ICONS['RIGHT'] if is_collapsed else ICONS['DOWN']
         op = row.operator("batch_stl.toggle_dir_tree", text="", icon=icon, emboss=False)
         op.dir_path = dir_path
 
@@ -1669,13 +1682,8 @@ class BATCH_STL_OT_clear_console(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
-        if getattr(scene, "batch_stl_info_global", False):
-            scene.batch_stl_global_console_logs.clear()
-            for p in scene.batch_stl_presets:
-                p.console_logs.clear()
-        else:
-            preset = get_active_preset(scene)
-            if preset: preset.console_logs.clear()
+        preset = get_active_preset(scene)
+        if preset: preset.console_logs.clear()
         return {'FINISHED'}
 
 # A multi-purpose operator that can handle moving lists up, down, deleting, and copying.
@@ -2217,8 +2225,11 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self.report({'ERROR'}, "Missing Root Directory") # Shows error popups at the bottom of Blender
             return {"CANCELLED"}
 
+        # UI Behavior for Infobox tracking
+        if context.scene.batch_stl_show_console:
+            context.scene.batch_stl_info_tab = 'LOG'
+
         self.preset.console_logs.clear()
-        context.scene.batch_stl_show_console = True
         verbose = scene.batch_stl_verbose_console
 
         # --- PRE-EVALUATE AND DIRECT EXPORT BYPASS FOR NO-OVERRIDE OBJECTS ---
@@ -2493,40 +2504,40 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
         prop_row.prop(item, "name", text="", emboss=False) # 'emboss=False' makes it look like plain text, not a button
 
         metrics = _ui_cache.get("preset_metrics", {}).get(item.name, {"has_ovr": False, "has_perm": False})
-        icon_ovr = 'NODETREE' if metrics["has_ovr"] else 'BLANK1'
-        icon_perm = 'FILE_REFRESH' if metrics["has_perm"] else 'BLANK1'
+        icon_ovr = ICONS['NODE'] if metrics["has_ovr"] else ICONS['BLANK']
+        icon_perm = ICONS['SWEEP'] if metrics["has_perm"] else ICONS['BLANK']
 
         icon_row = prop_row.row(align=True)
         icon_row.alignment = 'RIGHT'
         icon_row.label(text="", icon=icon_perm)
         icon_row.label(text="", icon=icon_ovr)
 
-        prop_row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
+        prop_row.prop(item, "preset_prefix", text="", emboss=False, icon=ICONS['DIR'])
 
         if item.is_exporting:
             row.prop(item, "export_progress", text=item.export_status, slider=True)
-            cancel_op = row.operator("batch_stl.cancel_export", text="", icon='CANCEL')
+            cancel_op = row.operator("batch_stl.cancel_export", text="", icon=ICONS['CANCEL'])
             cancel_op.preset_index = index
         else:
-            op = row.operator("export_scene.batch_stl_multi", text="", icon='EXPORT')
+            op = row.operator("export_scene.batch_stl_multi", text="", icon=ICONS['EXPORT'])
             op.preset_index = index
 
 class BATCH_STL_UL_collections(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
-        row.prop_search(item, "collection_name", bpy.data, "collections", text="", icon='OUTLINER_COLLECTION')
+        row.prop_search(item, "collection_name", bpy.data, "collections", text="", icon=ICONS['COLLECTION'])
         row.separator(factor=0.5)
         sub_row = row.row(align=True)
 
         # Converted implicit UI property toggle to a fully controlled internal operator
-        op = sub_row.operator("batch_stl.table_action", text="", icon='BOOKMARKS', depress=item.use_tag)
+        op = sub_row.operator("batch_stl.table_action", text="", icon=ICONS['TAG'], depress=item.use_tag)
         op.action = 'TOGGLE_COLLECTION_USE_TAG'
         op.c_idx = index
 
         sub_row.separator(factor=0.5)
         tag_row = sub_row.row(align=True)
         tag_row.prop(item, "tag", text="", emboss=False)
-        row.prop(item, "sub_path", text="", emboss=False, icon='FILE_FOLDER')
+        row.prop(item, "sub_path", text="", emboss=False, icon=ICONS['DIR'])
 
 class BATCH_STL_UL_objects(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -2536,7 +2547,7 @@ class BATCH_STL_UL_objects(bpy.types.UIList):
         row = split.row(align=True)
 
         # Converted implicit UI property toggle to a fully controlled internal operator
-        op = row.operator("batch_stl.table_action", text="", icon='CHECKBOX_HLT' if item.export else 'CHECKBOX_DEHLT', emboss=False)
+        op = row.operator("batch_stl.table_action", text="", icon=ICONS['CHECK_ON'] if item.export else ICONS['CHECK_OFF'], emboss=False)
         op.action = 'TOGGLE_OBJECT_EXPORT'
         op.o_idx = index
 
@@ -2545,12 +2556,12 @@ class BATCH_STL_UL_objects(bpy.types.UIList):
         # Right side: Tag and Directory settings (No boolean toggles, just labels)
         tools = split.row(align=True)
 
-        tools.label(text="", icon='BOOKMARKS')
+        tools.label(text="", icon=ICONS['TAG'])
         tools.prop(item, "tag", text="", emboss=False)
 
         tools.separator(factor=0.5)
 
-        tools.label(text="", icon='FILE_FOLDER')
+        tools.label(text="", icon=ICONS['DIR'])
         tools.prop(item, "sub_path", text="", emboss=False)
 
 class BATCH_STL_UL_console_logs(bpy.types.UIList):
@@ -2560,53 +2571,73 @@ class BATCH_STL_UL_console_logs(bpy.types.UIList):
 # A helper function that stamps down the same 4 or 6 arrow buttons wherever needed.
 def draw_inline_controls(layout, operator_id, use_clipboard=False):
     row = layout.row(align=True)
-    row.operator(operator_id, icon='ADD', text="").action = 'ADD'
-    row.operator(operator_id, icon='REMOVE', text="").action = 'REMOVE'
-    row.operator(operator_id, icon='TRIA_UP', text="").action = 'UP'
-    row.operator(operator_id, icon='TRIA_DOWN', text="").action = 'DOWN'
+    row.operator(operator_id, icon=ICONS['ADD'], text="").action = 'ADD'
+    row.operator(operator_id, icon=ICONS['DEL'], text="").action = 'REMOVE'
+    row.operator(operator_id, icon=ICONS['UP'], text="").action = 'UP'
+    row.operator(operator_id, icon=ICONS['DOWN'], text="").action = 'DOWN'
     if use_clipboard:
-        row.operator(operator_id, icon='COPYDOWN', text="").action = 'COPY'
-        row.operator(operator_id, icon='PASTEDOWN', text="").action = 'PASTE'
+        row.operator(operator_id, icon=ICONS['COPY'], text="").action = 'COPY'
+        row.operator(operator_id, icon=ICONS['PASTE'], text="").action = 'PASTE'
 
 
-def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text, is_preset=False, is_global=False):
+def draw_stats_table(parent_layout, stats_list):
+    col = parent_layout.column(align=True)
+    col.separator(factor=0.5)
+
+    row = col.row(align=True)
+    row.alignment = 'CENTER'
+
+    for i, (val, icon) in enumerate(stats_list):
+        if i > 0:
+            row.separator(factor=2.0)
+        row.label(text=str(val), icon=icon)
+
+    col.separator(factor=0.5)
+
+
+def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text, is_preset=False, is_global=False, is_locked=False):
     box = layout.box()
 
     header_row = box.row()
+    header_row.enabled = not is_locked
     is_open = getattr(scene, is_open_prop)
-    icon_open = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
+    icon_open = ICONS['DOWN'] if is_open else ICONS['RIGHT']
     header_row.prop(scene, is_open_prop, text="", icon=icon_open, emboss=False)
 
-    icon_header = 'WORLD' if is_global else ('PRESET' if is_preset else ('OUTLINER_COLLECTION' if is_pinned else 'OBJECT_DATA'))
-    header_row.label(text="", icon='DECORATE_OVERRIDE')
+    icon_header = ICONS['GLOBAL'] if is_global else (ICONS['PRESET'] if is_preset else (ICONS['COLLECTION'] if is_pinned else ICONS['OBJECT']))
+    header_row.label(text="", icon=ICONS['OVR'])
     header_row.label(text=title_text, icon=icon_header)
 
     op_row = header_row.row(align=True)
-    op = op_row.operator("batch_stl.table_action", text="", icon='ADD')
+    op_row.enabled = not is_locked
+    op = op_row.operator("batch_stl.table_action", text="", icon=ICONS['ADD'])
     op.action = 'ADD_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global
-    op = op_row.operator("batch_stl.table_action", text="", icon='PASTEDOWN')
+    op = op_row.operator("batch_stl.table_action", text="", icon=ICONS['PASTE'])
     op.action = 'PASTE_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global
 
     if not is_open:
         return
 
+    content_col = box.column()
+    content_col.enabled = not is_locked
+
     if len(nodegroups) == 0:
-        box.label(text="No overrides defined.")
+        content_col.label(text="No overrides defined.")
         return
 
     for ng_idx, ng in enumerate(nodegroups):
-        ng_box = box.box()
+        ng_box = content_col.box()
         ng_layout = ng_box.column()
         ng_row = ng_layout.row(align=True)
-        op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon=ICONS['ADD']); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
 
         ng_row.prop_search(ng, "group_name", bpy.data, "node_groups", text="")
 
-        op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon=ICONS['UP']); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon=ICONS['DOWN']); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
 
-        op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon=ICONS['COPY']); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon=ICONS['DEL']); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
 
         if not ng.nodes:
             continue
@@ -2622,13 +2653,13 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
             node_layout = node_container.column()
 
             n_row = node_layout.row(align=True)
-            op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
-            n_row.prop(node, "name", text="", icon='NODETREE')
+            op = n_row.operator("batch_stl.table_action", text="", icon=ICONS['ADD']); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
+            n_row.prop(node, "name", text="", icon=ICONS['NODE'])
 
             if len(ng.nodes) > 1:
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon=ICONS['UP']); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon=ICONS['DOWN']); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon=ICONS['DEL']); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
 
             if not node.inputs:
                 continue
@@ -2647,7 +2678,7 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     s_main = i_row.split(factor=0.35, align=False)
                     c_inp = s_main.row(align=True)
 
-                    op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
+                    op = c_inp.operator("batch_stl.table_action", text="", icon=ICONS['ADD'])
                     op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = -1
 
                     ng_ptr = bpy.data.node_groups.get(ng.group_name)
@@ -2666,9 +2697,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     c_dir = s_val.row(align=True)
 
                     if len(node.inputs) > 1:
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                    op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['UP']); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['DOWN']); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                    op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['DEL']); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
 
                     continue
 
@@ -2681,9 +2712,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
                     if i_first:
                         if getattr(val, "use_sweep", False):
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
+                            op = c_inp.operator("batch_stl.table_action", text="", icon=ICONS['SWEEP'], depress=True)
                         else:
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
+                            op = c_inp.operator("batch_stl.table_action", text="", icon=ICONS['ADD'])
                         op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
 
                         ng_ptr = bpy.data.node_groups.get(ng.group_name)
@@ -2731,11 +2762,11 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
                     if is_permutation:
                         # Converted implicit UI property toggles to fully controlled internal operators
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='FILE_FOLDER', depress=val.use_dir)
+                        op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['DIR'], depress=val.use_dir)
                         op.action = 'TOGGLE_VALUE_USE_DIR'
                         op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='BOOKMARKS', depress=val.use_tag)
+                        op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['TAG'], depress=val.use_tag)
                         op.action = 'TOGGLE_VALUE_USE_TAG'
                         op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
@@ -2743,15 +2774,15 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
                     if i_first:
                         if len(node.inputs) > 1:
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['UP']); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['DOWN']); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
 
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE_OR_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
+                        op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['DEL']); op.action = 'DEL_VALUE_OR_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
                     else:
                         if len(inp.values) > 1:
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['UP']); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['DOWN']); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon=ICONS['DEL']); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
 # This class defines the massive main panel in the 3D Viewport Toolbar ('N' panel).
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
@@ -2769,83 +2800,68 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         dir_col = layout.column()
         dir_col.enabled = not any_exporting
         dir_row = dir_col.row(align=True)
-        dir_row.operator("batch_stl.import_presets_json", text="", icon='IMPORT')
-        dir_row.operator("batch_stl.export_presets_json", text="", icon='EXPORT')
-        dir_row.prop(scene, "batch_stl_show_console", text="", icon='INFO', toggle=True)
+        dir_row.operator("batch_stl.import_presets_json", text="", icon=ICONS['IMPORT'])
+        dir_row.operator("batch_stl.export_presets_json", text="", icon=ICONS['EXPORT'])
+        dir_row.prop(scene, "batch_stl_show_console", text="", icon=ICONS['INFO'], toggle=True)
         dir_row.prop(scene, "batch_stl_root_dir")
 
         active_preset = get_active_preset(scene)
+        stats = _ui_cache.get("stats", {})
 
         if scene.batch_stl_show_console:
             info_box = layout.box()
 
             tab_row = info_box.row()
             tab_row.prop(scene, "batch_stl_info_tab", expand=True)
-            tab_row.prop(scene, "batch_stl_info_global", text="Global", toggle=True, icon='WORLD')
 
             if scene.batch_stl_info_tab == 'LOG':
-                if scene.batch_stl_info_global:
-                    info_box.template_list("BATCH_STL_UL_console_logs", "", scene, "batch_stl_global_console_logs", scene, "batch_stl_global_console_index", rows=6)
+                if active_preset:
+                    info_box.template_list("BATCH_STL_UL_console_logs", "", active_preset, "console_logs", active_preset, "console_index", rows=6)
+                    clear_col = info_box.column()
+                    clear_col.enabled = not any_exporting
+                    clear_col.operator("batch_stl.clear_console", text="Clear Log", icon=ICONS['DEL'])
                 else:
-                    if active_preset:
-                        info_box.template_list("BATCH_STL_UL_console_logs", "", active_preset, "console_logs", active_preset, "console_index", rows=6)
-                    else:
-                        info_box.label(text="Select a preset to view logs.")
-
-                clear_col = info_box.column()
-                clear_col.enabled = not any_exporting
-                clear_col.operator("batch_stl.clear_console", text="Clear Log", icon='TRASH')
+                    info_box.label(text="Select a preset to view logs.", icon=ICONS['INFO'])
 
             elif scene.batch_stl_info_tab == 'TREE':
+                tree_tools = info_box.row()
+                tree_tools.prop(scene, "batch_stl_info_global", text="Global Tree View", toggle=True, icon=ICONS['GLOBAL'])
+
                 tree_dict, duplicates = _ui_cache.get("tree", ({}, set()))
                 if duplicates:
                     warn_box = info_box.box()
                     warn_row = warn_box.row()
-                    warn_row.label(text=f"WARNING: {len(duplicates)} naming collisions detected! Files will be overwritten.", icon='ERROR')
+                    warn_row.label(text=f"WARNING: {len(duplicates)} naming collisions detected! Files will be overwritten.", icon=ICONS['ERROR'])
 
                 col = info_box.column(align=True)
                 draw_tree_dict(col, tree_dict, duplicates=duplicates)
 
             info_box.separator()
 
-            metrics = _ui_cache.get("metrics", {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0})
-            col_metrics = _ui_cache.get("active_col_metrics", {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0})
-
-            stat_box = info_box.box()
-            stat_row = stat_box.row()
-            stat_row.label(text=f"Total Collections: {metrics['total_collections']}", icon='OUTLINER_COLLECTION')
-            stat_row.label(text=f"Total Output Files: {metrics['total_objects']}", icon='FILE_3D')
-
-            stat_row2 = stat_box.row()
-            c_name = col_metrics['c_name'] or 'None'
-            stat_row2.label(text=f"Active Col: {c_name} | {col_metrics['num_targets']} Targets | {col_metrics['mapping_total_objects']} Files", icon='MODIFIER')
-
-            info_box.separator()
-
             tip_box = info_box.box()
             tip_header = tip_box.row()
-            icon_tip = 'TRIA_DOWN' if scene.batch_stl_ui_tips else 'TRIA_RIGHT'
+            icon_tip = ICONS['DOWN'] if scene.batch_stl_ui_tips else ICONS['RIGHT']
             tip_header.prop(scene, "batch_stl_ui_tips", text="", icon=icon_tip, emboss=False)
-            tip_header.label(text="OVERRIDE INFO", icon='INFO')
+            tip_header.label(text="OVERRIDE INFO", icon=ICONS['INFO'])
 
             if scene.batch_stl_ui_tips:
                 col = tip_box.column()
-                col.label(text="Hierarchy: Global > Preset > Collection > Object > NodeGroup > Node.", icon='BLANK1')
-                col.label(text="For modifier targets, leave Node blank or set as <Modifier Interface>", icon='BLANK1')
+                col.label(text="Hierarchy: Global > Preset > Collection > Object > NodeGroup > Node.", icon=ICONS['BLANK'])
+                col.label(text="For modifier targets, leave Node blank or set as <Modifier Interface>", icon=ICONS['BLANK'])
                 col.separator()
 
-                col.label(text="Sweep Mode (Shift-Click '+' button to toggle):", icon='FILE_REFRESH')
-                col.label(text="  • Floats/Ints: Define start, step, and count", icon='BLANK1')
-                col.label(text="  • Menus/Bools: Auto-iterates all values", icon='BLANK1')
-                col.label(text="  • Shift-Click when active to populate all sweep values", icon='BLANK1')
+                col.label(text="Sweep Mode (Shift-Click '+' button to toggle):", icon=ICONS['SWEEP'])
+                col.label(text="  • Floats/Ints: Define start, step, and count", icon=ICONS['BLANK'])
+                col.label(text="  • Menus/Bools: Auto-iterates all values", icon=ICONS['BLANK'])
+                col.label(text="  • Shift-Click when active to populate all sweep values", icon=ICONS['BLANK'])
                 col.separator()
 
-                col.label(text="Export Tools (Per Value):", icon='BLANK1')
-                col.label(text="  • Folder Icon: Save this value's exports into a subfolder", icon='FILE_FOLDER')
-                col.label(text="  • Bookmark Icon: Append/Prepend a tag to filename", icon='BOOKMARKS')
+                col.label(text="Export Tools (Per Value):", icon=ICONS['BLANK'])
+                col.label(text="  • Folder Icon: Save this value's exports into a subfolder", icon=ICONS['DIR'])
+                col.label(text="  • Bookmark Icon: Append/Prepend a tag to filename", icon=ICONS['TAG'])
 
-                col.label(text="Tag Formatting:", icon='BLANK1')
-                col.label(text="  • [ tag ] replaces input value, [ _tag ] appends, [ tag_ ] prepends", icon='BLANK1')
+                col.label(text="Tag Formatting:", icon=ICONS['BLANK'])
+                col.label(text="  • [ tag ] replaces input value, [ _tag ] appends, [ tag_ ] prepends", icon=ICONS['BLANK'])
 
         layout.separator()
 
@@ -2853,20 +2869,20 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         g_col = layout.column()
         g_col.enabled = not any_exporting
         g_box = g_col.box()
-        draw_overrides_table(g_box, scene, scene.batch_stl_global_nodegroups, False, "batch_stl_ui_global_ovr_main", "Global Overrides", is_global=True)
+        draw_overrides_table(g_box, scene, scene.batch_stl_global_nodegroups, False, "batch_stl_ui_global_ovr_main", "Global Overrides", is_global=True, is_locked=any_exporting)
 
         layout.separator()
 
         p_box = layout.box()
         p_header = p_box.row()
-        icon = 'TRIA_DOWN' if scene.batch_stl_ui_presets else 'TRIA_RIGHT'
+        icon = ICONS['DOWN'] if scene.batch_stl_ui_presets else ICONS['RIGHT']
 
         p_header_props = p_header.row()
         p_header_props.enabled = not any_exporting
         p_header_props.prop(scene, "batch_stl_ui_presets", text="", icon=icon, emboss=False)
-        p_header_props.label(text=f"Presets in [ {scene.name} ] scene", icon='PRESET')
+        p_header_props.label(text=f"Presets in [ {scene.name} ] scene", icon=ICONS['PRESET'])
 
-        if active_preset: p_header_props.label(text=f"Last: {active_preset.last_export_time:.2f}s", icon='TIME')
+        if active_preset: p_header_props.label(text=f"Last: {active_preset.last_export_time:.2f}s", icon=ICONS['TIME'])
 
         inline_col = p_header.column()
         inline_col.enabled = not any_exporting
@@ -2875,15 +2891,23 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if scene.batch_stl_ui_presets:
             p_box.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
 
+            # Children Stats Display for Presets Section
+            g_stats = stats.get("global", {"presets": 0, "cols": 0, "objs": 0, "exp": 0})
+            draw_stats_table(p_box, [
+                (g_stats['presets'], ICONS['PRESET']),
+                (g_stats['cols'], ICONS['COLLECTION']),
+                (g_stats['objs'], ICONS['OBJECT']),
+                (g_stats['exp'], ICONS['SWEEP'])
+            ])
+
         if active_preset:
-            p_box.separator(factor=0.5)
-            draw_overrides_table(p_box, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ] preset", is_preset=True)
+            draw_overrides_table(p_box, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ] preset", is_preset=True, is_locked=active_preset.is_exporting)
 
         if not active_preset:
             rest_col = layout.column()
             rest_col.enabled = not any_exporting
             rest_col.separator()
-            rest_col.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
+            rest_col.prop(scene, "batch_stl_verbose_console", toggle=True, icon=ICONS['CONSOLE'])
             return
 
         # UI Freeze Container for all details beneath presets
@@ -2893,20 +2917,26 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         main_col.separator(factor=0.5)
         m_box = main_col.box()
         m_header = m_box.row()
-        icon_m = 'TRIA_DOWN' if scene.batch_stl_ui_collections else 'TRIA_RIGHT'
+        icon_m = ICONS['DOWN'] if scene.batch_stl_ui_collections else ICONS['RIGHT']
         m_header.prop(scene, "batch_stl_ui_collections", text="", icon=icon_m, emboss=False)
 
-        m_title = f"Collections in [ {active_preset.name} ] preset"
-        m_header.label(text=m_title, icon='OUTLINER_COLLECTION')
+        m_header.label(text=f"Collections in [ {active_preset.name} ] preset", icon=ICONS['COLLECTION'])
         draw_inline_controls(m_header, "batch_stl.collection_actions", use_clipboard=True)
 
         if scene.batch_stl_ui_collections:
             m_box.template_list("BATCH_STL_UL_collections", "", active_preset, "collections", active_preset, "collection_index", rows=5)
 
+            # Children Stats Display for Collections Section
+            p_stats = stats.get("presets", {}).get(active_preset.name, {"cols": 0, "objs": 0, "exp": 0})
+            draw_stats_table(m_box, [
+                (p_stats['cols'], ICONS['COLLECTION']),
+                (p_stats['objs'], ICONS['OBJECT']),
+                (p_stats['exp'], ICONS['SWEEP'])
+            ])
+
         active_col = get_active_collection(active_preset)
         if active_col:
-            m_box.separator(factor=0.5)
-            draw_overrides_table(m_box, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides [ {active_col.collection_name or 'Shared'} ]")
+            draw_overrides_table(m_box, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides [ {active_col.collection_name or 'Shared'} ]", is_locked=active_preset.is_exporting)
 
         main_col.separator()
 
@@ -2914,20 +2944,28 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
             o_box = main_col.box()
             o_header = o_box.row()
-            icon_o = 'TRIA_DOWN' if scene.batch_stl_ui_objects else 'TRIA_RIGHT'
+            icon_o = ICONS['DOWN'] if scene.batch_stl_ui_objects else ICONS['RIGHT']
             o_header.prop(scene, "batch_stl_ui_objects", text="", icon=icon_o, emboss=False)
-            o_header.label(text=f"Objects in [ {active_col.collection_name or 'Collection'} ] collection", icon='OBJECT_DATA')
+            o_header.label(text=f"Objects in [ {active_col.collection_name or 'Collection'} ] collection", icon=ICONS['OBJECT'])
 
             if scene.batch_stl_ui_objects:
                 o_box.template_list("BATCH_STL_UL_objects", "", active_col, "objects", active_col, "object_index", rows=5)
 
+                # Children Stats Display for Objects Section
+                c_idx = active_preset.collection_index
+                col_key = f"{active_preset.name}_c{c_idx}"
+                c_stats = stats.get("cols", {}).get(col_key, {"objs": 0, "exp": 0})
+                draw_stats_table(o_box, [
+                    (c_stats['objs'], ICONS['OBJECT']),
+                    (c_stats['exp'], ICONS['SWEEP'])
+                ])
+
             active_obj = get_active_object(active_col)
             if active_obj:
-                o_box.separator(factor=0.5)
-                draw_overrides_table(o_box, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Overrides for [ {active_obj.name} ] object")
+                draw_overrides_table(o_box, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Overrides for [ {active_obj.name} ] object", is_locked=active_preset.is_exporting)
 
         main_col.separator()
-        main_col.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
+        main_col.prop(scene, "batch_stl_verbose_console", toggle=True, icon=ICONS['CONSOLE'])
 
 
 # ==============================================================================

@@ -763,6 +763,9 @@ def rebuild_ui_cache_if_dirty():
                 for area in window.screen.areas:
                     if area.type == 'VIEW_3D':
                         area.tag_redraw()
+                        for region in area.regions:
+                            if region.type == 'UI':
+                                region.tag_redraw()
         return 1.0
 
     # 2. Re-calculate metrics fully decoupled from UI
@@ -835,7 +838,9 @@ def rebuild_ui_cache_if_dirty():
             for area in window.screen.areas:
                 if area.type == 'VIEW_3D':
                     area.tag_redraw()
-
+                    for region in area.regions:
+                        if region.type == 'UI':
+                            region.tag_redraw()
     return 1.0
 
 @persistent
@@ -2890,6 +2895,7 @@ def reset_batch_stl_state(scene):
             p.export_progress = 0.0
             p.export_status = ""
     except Exception: pass
+    mark_dirty()
     if "--batch-stl-headless" not in sys.argv:
             if not bpy.app.timers.is_registered(rebuild_ui_cache_if_dirty):
                 bpy.app.timers.register(rebuild_ui_cache_if_dirty)

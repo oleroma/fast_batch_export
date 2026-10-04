@@ -2737,7 +2737,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
         if scene.batch_stl_show_console:
             c_box = layout.box()
-            c_box.label(text="Global Export Console Log", icon='CONSOLE')
+            c_box.label(text="Console Log", icon='CONSOLE')
             if active_preset:
                 c_box.template_list("BATCH_STL_UL_console_logs", "", active_preset, "console_logs", active_preset, "console_index", rows=6)
                 clear_col = c_box.column()
@@ -2944,7 +2944,7 @@ def register():
         bpy.utils.register_class(cls)
 
     # Attach our custom variables directly to Blender's Scene object so they are saved per-file.
-    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", update=upd_root_dir)
+    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root", default="//", subtype="DIR_PATH", update=upd_root_dir)
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
 
     # NEW: Global overrides attached directly to the scene

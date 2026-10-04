@@ -716,8 +716,11 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
             draw_tree_dict(box, tree_node[k], dir_path, toggled_list, duplicates, next_actual)
 
     for f in tree_node.get('_files', []):
-        col = layout.split(factor=0.025).column()
-        row = col.column().row()
+        split = layout.split(factor=0.025)
+        split.column()        # Consume the 2.5% width as an empty indent spacer
+        col = split.column()  # Assign the remaining 97.5% width to your content
+
+        row = col.row()
         row.scale_y = 0.4
         if (os.path.join(actual_path, f) if actual_path else f) in duplicates: row.alert = True
         row.label(text=str(f))

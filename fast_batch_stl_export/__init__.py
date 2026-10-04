@@ -2536,7 +2536,8 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
     icon_open = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
     header_row.prop(scene, is_open_prop, text="", icon=icon_open, emboss=False)
 
-    icon_header = 'WORLD' if is_global else ('PRESET' if is_preset else ('OUTLINER_COLLECTION' if is_pinned else 'OUTLINER_OB_MESH'))
+    icon_header = 'WORLD' if is_global else ('PRESET' if is_preset else ('OUTLINER_COLLECTION' if is_pinned else 'OBJECT_DATA'))
+    header_row.label(text="", icon='DECORATE_OVERRIDE')
     header_row.label(text=title_text, icon=icon_header)
 
     op_row = header_row.row(align=True)
@@ -2762,7 +2763,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         p_header_props = p_header.row()
         p_header_props.enabled = not any_exporting
         p_header_props.prop(scene, "batch_stl_ui_presets", text="", icon=icon, emboss=False)
-        p_header_props.label(text="Presets", icon='PRESET')
+        p_header_props.label(text=f"Presets in [ {scene.name} ] scene", icon='PRESET')
 
         if active_preset: p_header_props.label(text=f"Last: {active_preset.last_export_time:.2f}s", icon='TIME')
 
@@ -2775,7 +2776,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
         if active_preset:
             p_box.separator(factor=0.5)
-            draw_overrides_table(p_box, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Preset Overrides ({active_preset.name})", is_preset=True)
+            draw_overrides_table(p_box, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ] preset", is_preset=True)
 
         if not active_preset:
             rest_col = layout.column()
@@ -2796,7 +2797,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         icon_m = 'TRIA_DOWN' if scene.batch_stl_ui_collections else 'TRIA_RIGHT'
         m_header.prop(scene, "batch_stl_ui_collections", text="", icon=icon_m, emboss=False)
 
-        m_title = f"{active_preset.name} | {metrics['total_collections']} collections | {metrics['total_objects']} files"
+        m_title = f"Collections in [ {active_preset.name} ] preset | {metrics['total_collections']} collections | {metrics['total_objects']} files"
         m_header.label(text=m_title, icon='OUTLINER_COLLECTION')
         draw_inline_controls(m_header, "batch_stl.collection_actions", use_clipboard=True)
 
@@ -2806,7 +2807,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         active_col = get_active_collection(active_preset)
         if active_col:
             m_box.separator(factor=0.5)
-            draw_overrides_table(m_box, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides ({active_col.collection_name or 'Shared'})")
+            draw_overrides_table(m_box, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides [ {active_col.collection_name or 'Shared'} ]")
 
         main_col.separator()
 
@@ -2816,7 +2817,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             o_header = o_box.row()
             icon_o = 'TRIA_DOWN' if scene.batch_stl_ui_objects else 'TRIA_RIGHT'
             o_header.prop(scene, "batch_stl_ui_objects", text="", icon=icon_o, emboss=False)
-            o_header.label(text=f"Objects in {active_col.collection_name or 'Collection'}", icon='OBJECT_DATA')
+            o_header.label(text=f"Objects in [ {active_col.collection_name or 'Collection'} ] collection", icon='OBJECT_DATA')
 
             if scene.batch_stl_ui_objects:
                 o_box.template_list("BATCH_STL_UL_objects", "", active_col, "objects", active_col, "object_index", rows=5)
@@ -2824,7 +2825,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             active_obj = get_active_object(active_col)
             if active_obj:
                 o_box.separator(factor=0.5)
-                draw_overrides_table(o_box, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Object Overrides ({active_obj.name})")
+                draw_overrides_table(o_box, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Overrides for [ {active_obj.name} ] object")
 
             main_col.separator()
             col_metrics = _ui_cache.get("active_col_metrics", {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0})

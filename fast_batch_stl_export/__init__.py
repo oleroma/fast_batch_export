@@ -872,12 +872,22 @@ def run_headless_export(job_file_path):
 # === [ 3. PROPERTY GROUPS ] ===
 # ==============================================================================
 
-_state = {"is_importing": False, "is_pasting": False, "is_populating": False}
+_state = {"is_importing": False, "is_pasting": False, "is_populating": False, "suppress_undo": False}
+
+class suppress_undo:
+    _depth = 0
+    def __enter__(self):
+        suppress_undo._depth += 1
+        _state["suppress_undo"] = True
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        suppress_undo._depth = max(0, suppress_undo._depth - 1)
+        _state["suppress_undo"] = (suppress_undo._depth > 0)
 
 def update_with_undo(action_name):
     def _updater(self, context):
         mark_dirty()
-        if not (_state.get("is_importing") or _state.get("is_pasting") or _state.get("is_populating")):
+        if not any(_state.values()):
             try: bpy.ops.ed.undo_push(message=action_name)
             except Exception: pass
     return _updater
@@ -922,9 +932,10 @@ def on_input_name_update(self, context):
             for n in ng.nodes:
                 if self in n.inputs.values():
                     ng_ptr = bpy.data.node_groups.get(ng.group_name)
-                    self.override_type = infer_input_type(ng_ptr, n.name, self.name)
-                    for v in self.values: v.use_sweep = False
-                    if not (_state.get("is_importing") or _state.get("is_pasting") or _state.get("is_populating")):
+                    with suppress_undo():
+                        self.override_type = infer_input_type(ng_ptr, n.name, self.name)
+                        for v in self.values: v.use_sweep = False
+                    if not any(_state.values()):
                         try: bpy.ops.ed.undo_push(message="Update Input Socket Name")
                         except Exception: pass
                     return
@@ -990,7 +1001,7 @@ class BatchSTLInput(bpy.types.PropertyGroup):
     values: bpy.props.CollectionProperty(type=BatchSTLValue)
 
 class BatchSTLNode(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Target Node", default="", search=search_target_node_cb, update=update_with_undo("Update Target Node"), description="Select <Modifier Interface> to target the modifier directly")
+    name: bpy.props.StringProperty(name="Target Node", default="<Modifier Interface>", search=search_target_node_cb, update=update_with_undo("Update Target Node"), description="Select <Modifier Interface> to target the modifier directly")
     inputs: bpy.props.CollectionProperty(type=BatchSTLInput)
 
 class BatchSTLNodeGroup(bpy.types.PropertyGroup):
@@ -1073,9 +1084,8 @@ class ListActionHandler:
     @staticmethod
     def perform_action(action, lst, index, shift_pressed, clipboard_key, copy_func, paste_func, prevent_remove_active=False):
         global _state, _clipboard
-        if action == 'PASTE': _state["is_pasting"] = True
         new_index = index
-        try:
+        with suppress_undo():
             if action == 'ADD':
                 lst.add(); new_index = len(lst) - 1
             elif action == 'REMOVE' and lst:
@@ -1091,8 +1101,6 @@ class ListActionHandler:
                 _clipboard[clipboard_key] = copy_func(lst[index])
             elif action == 'PASTE' and _clipboard.get(clipboard_key):
                 paste_func(lst.add(), _clipboard[clipboard_key]); new_index = len(lst) - 1
-        finally:
-            if action == 'PASTE': _state["is_pasting"] = False
         return new_index
 
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
@@ -1125,9 +1133,10 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
         if prevent_remove:
             self.report({'WARNING'}, "Cannot remove a preset while it is actively exporting.")
         else:
-            context.scene.batch_stl_preset_index = ListActionHandler.perform_action(
-                self.action, lst, idx, self.shift_pressed, "preset", copy_preset_to_dict, paste_preset_from_dict, prevent_remove_active=prevent_remove
-            )
+            with suppress_undo():
+                context.scene.batch_stl_preset_index = ListActionHandler.perform_action(
+                    self.action, lst, idx, self.shift_pressed, "preset", copy_preset_to_dict, paste_preset_from_dict, prevent_remove_active=prevent_remove
+                )
             if self.action != 'COPY': bpy.ops.ed.undo_push(message=f"Preset Action: {self.action}")
 
         mark_dirty()
@@ -1159,9 +1168,10 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
 
-        preset.collection_index = ListActionHandler.perform_action(
-            self.action, preset.collections, preset.collection_index, self.shift_pressed, "collection", copy_collection_to_dict, paste_collection_from_dict
-        )
+        with suppress_undo():
+            preset.collection_index = ListActionHandler.perform_action(
+                self.action, preset.collections, preset.collection_index, self.shift_pressed, "collection", copy_collection_to_dict, paste_collection_from_dict
+            )
         if self.action != 'COPY': bpy.ops.ed.undo_push(message=f"Collection Action: {self.action}")
 
         mark_dirty()
@@ -1359,32 +1369,26 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
 
-        global _state
-        if self.action == 'PASTE_GROUP' or (self.action in ['MOVE_GROUP_UP', 'MOVE_GROUP_DOWN'] and self.shift_pressed):
-            _state["is_pasting"] = True
+        with suppress_undo():
+            try:
+                if self.action == 'TOGGLE_COLLECTION_USE_TAG':
+                    if 0 <= self.c_idx < len(preset.collections): preset.collections[self.c_idx].use_tag = not preset.collections[self.c_idx].use_tag
+                elif self.action == 'TOGGLE_OBJECT_EXPORT':
+                    active_col = get_active_collection(preset)
+                    if active_col and 0 <= self.o_idx < len(active_col.objects): active_col.objects[self.o_idx].export = not active_col.objects[self.o_idx].export
+                else:
+                    ng_list = self._resolve_context_list(context, preset)
+                    if ng_list is None: return {'CANCELLED'}
 
-        try:
-            if self.action == 'TOGGLE_COLLECTION_USE_TAG':
-                if 0 <= self.c_idx < len(preset.collections): preset.collections[self.c_idx].use_tag = not preset.collections[self.c_idx].use_tag
-            elif self.action == 'TOGGLE_OBJECT_EXPORT':
-                active_col = get_active_collection(preset)
-                if active_col and 0 <= self.o_idx < len(active_col.objects): active_col.objects[self.o_idx].export = not active_col.objects[self.o_idx].export
-            else:
-                ng_list = self._resolve_context_list(context, preset)
-                if ng_list is None: return {'CANCELLED'}
-
-                if self.action == 'TOGGLE_VALUE_USE_DIR': ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_dir = not ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_dir
-                elif self.action == 'TOGGLE_VALUE_USE_TAG': ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_tag = not ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_tag
-                elif 'GROUP' in self.action: self._handle_group_action(ng_list, context, preset)
-                elif 'NODE' in self.action: self._handle_node_action(ng_list)
-                elif 'INPUT' in self.action: self._handle_input_action(ng_list)
-                elif 'VALUE' in self.action: self._handle_value_action(ng_list)
-        except IndexError:
-            if self.action == 'PASTE_GROUP' or (self.action in ['MOVE_GROUP_UP', 'MOVE_GROUP_DOWN'] and self.shift_pressed): _state["is_pasting"] = False
-            self.report({'WARNING'}, "UI Sync Error: List mutated unexpectedly. Please try again.")
-            return {'CANCELLED'}
-        finally:
-            if self.action == 'PASTE_GROUP' or (self.action in ['MOVE_GROUP_UP', 'MOVE_GROUP_DOWN'] and self.shift_pressed): _state["is_pasting"] = False
+                    if self.action == 'TOGGLE_VALUE_USE_DIR': ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_dir = not ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_dir
+                    elif self.action == 'TOGGLE_VALUE_USE_TAG': ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_tag = not ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_tag
+                    elif 'GROUP' in self.action: self._handle_group_action(ng_list, context, preset)
+                    elif 'NODE' in self.action: self._handle_node_action(ng_list)
+                    elif 'INPUT' in self.action: self._handle_input_action(ng_list)
+                    elif 'VALUE' in self.action: self._handle_value_action(ng_list)
+            except IndexError:
+                self.report({'WARNING'}, "UI Sync Error: List mutated unexpectedly. Please try again.")
+                return {'CANCELLED'}
 
         if self.action != 'COPY_GROUP': bpy.ops.ed.undo_push(message=f"Table Action: {self.action}")
         mark_dirty()
@@ -1832,6 +1836,21 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
     bl_category = "Export"
     bl_label = "Fast Batch STL Export"
 
+    def draw_header(self, context):
+        self.layout.label(text="", icon=ICONS['EXPORT'])
+
+    def draw_header_preset(self, context):
+        layout = self.layout
+        scene = context.scene
+        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+
+        row = layout.row(align=True)
+        row.enabled = not any_exporting
+        row.operator("batch_stl.import_presets_json", text="", icon=ICONS['IMPORT'])
+        row.operator("batch_stl.export_presets_json", text="", icon=ICONS['EXPORT'])
+        row.prop(scene, "batch_stl_show_console", text="", icon=ICONS['INFO'], toggle=True)
+        row.separator()
+
     def draw(self, context):
         layout = self.layout
         scene = context.scene
@@ -1840,11 +1859,7 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
 
         dir_col = layout.column()
         dir_col.enabled = not any_exporting
-        dir_row = dir_col.row(align=True)
-        dir_row.operator("batch_stl.import_presets_json", text="", icon=ICONS['IMPORT'])
-        dir_row.operator("batch_stl.export_presets_json", text="", icon=ICONS['EXPORT'])
-        dir_row.prop(scene, "batch_stl_show_console", text="", icon=ICONS['INFO'], toggle=True)
-        dir_row.prop(scene, "batch_stl_root_dir")
+        dir_col.prop(scene, "batch_stl_root_dir")
 
         active_preset = get_active_preset(scene)
         stats = _ui_cache.get("stats", {})
@@ -1923,15 +1938,21 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
         return True
 
     def draw_header(self, context):
+        self.layout.label(text="", icon=ICONS['PRESET'])
+
+    def draw_header_preset(self, context):
         layout = self.layout
         scene = context.scene
         any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+        active_preset = get_active_preset(scene)
 
-        layout.separator()
         row = layout.row(align=True)
-        row.alignment = 'RIGHT'
+        if active_preset and active_preset.last_export_time > 0:
+            row.label(text=f"{active_preset.last_export_time:.2f}s", icon=ICONS['TIME'])
+            row.separator()
         row.enabled = not any_exporting
         draw_inline_controls(row, "batch_stl.preset_actions", use_clipboard=True)
+        row.separator()
 
     def draw(self, context):
         layout = self.layout
@@ -1941,9 +1962,6 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
         stats = _ui_cache.get("stats", {})
 
         layout.enabled = not any_exporting
-
-        if active_preset:
-            layout.label(text=f"Last Export: {active_preset.last_export_time:.2f}s", icon=ICONS['TIME'])
 
         content_col = layout.column(align=True)
         list_box = content_col.box()
@@ -1972,15 +1990,17 @@ class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
         return get_active_preset(context.scene) is not None
 
     def draw_header(self, context):
+        self.layout.label(text="", icon=ICONS['COLLECTION'])
+
+    def draw_header_preset(self, context):
         layout = self.layout
         scene = context.scene
         any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
 
-        layout.separator()
         row = layout.row(align=True)
-        row.alignment = 'RIGHT'
         row.enabled = not any_exporting
         draw_inline_controls(row, "batch_stl.collection_actions", use_clipboard=True)
+        row.separator()
 
     def draw(self, context):
         layout = self.layout
@@ -2019,6 +2039,9 @@ class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
         if not active_preset: return False
         return get_active_collection(active_preset) is not None
 
+    def draw_header(self, context):
+        self.layout.label(text="", icon=ICONS['OBJECT'])
+
     def draw(self, context):
         layout = self.layout
         scene = context.scene
@@ -2051,6 +2074,8 @@ class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
 
 @persistent
 def reset_batch_stl_state(scene):
+    suppress_undo._depth = 0
+    for k in _state: _state[k] = False
     try:
         for p in bpy.context.scene.batch_stl_presets:
             p.is_exporting, p.cancel_export, p.export_progress, p.export_status = False, False, 0.0, ""

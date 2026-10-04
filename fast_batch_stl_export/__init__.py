@@ -486,13 +486,25 @@ def get_active_object(collection):
     return None
 
 def log_to_console(preset, text):
-    log = preset.console_logs.add()
-    log.text = text
-    preset.console_index = len(preset.console_logs) - 1
-    # Keep the log list small so we don't run out of memory.
-    if len(preset.console_logs) > 300:
-        preset.console_logs.remove(0) # delete oldest
+    if preset:
+        log = preset.console_logs.add()
+        log.text = text
         preset.console_index = len(preset.console_logs) - 1
+        # Keep the log list small so we don't run out of memory.
+        if len(preset.console_logs) > 300:
+            preset.console_logs.remove(0) # delete oldest
+            preset.console_index = len(preset.console_logs) - 1
+
+    # Mirror logs to the global console
+    try:
+        scene = bpy.context.scene
+        g_log = scene.batch_stl_global_console_logs.add()
+        g_log.text = f"[{preset.name}] {text}" if preset else text
+        scene.batch_stl_global_console_index = len(scene.batch_stl_global_console_logs) - 1
+        if len(scene.batch_stl_global_console_logs) > 1000:
+            scene.batch_stl_global_console_logs.remove(0)
+            scene.batch_stl_global_console_index = len(scene.batch_stl_global_console_logs) - 1
+    except Exception: pass
 
 # Ensures the Objects UI list stays perfectly synced with Blender's active collection outliner
 def sync_collection_objects(c_prop, c_ptr=None):
@@ -740,6 +752,18 @@ def rebuild_ui_cache_if_dirty():
         preset_metrics[p.name] = {"has_ovr": ho, "has_perm": hp}
     _ui_cache["preset_metrics"] = preset_metrics
 
+    # If the info box is closed, bypass heavy object/depsgraph traversal completely
+    if not getattr(scene, "batch_stl_show_console", False):
+        if getattr(context, "window_manager", None):
+            for window in context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
+                        for region in area.regions:
+                            if region.type == 'UI':
+                                region.tag_redraw()
+        return 1.0
+
     # 1. Evaluate explicit visibility to prevent recursive outliner walks on redraw
     visibility = {}
     if hasattr(context, "view_layer") and context.view_layer:
@@ -753,7 +777,7 @@ def rebuild_ui_cache_if_dirty():
     _ui_cache["visibility"] = visibility
 
     preset = get_active_preset(scene)
-    if not preset:
+    if not preset and not getattr(scene, "batch_stl_info_global", False):
         _ui_cache["metrics"] = {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0}
         _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
         _ui_cache["tree"] = ({}, set())
@@ -769,29 +793,35 @@ def rebuild_ui_cache_if_dirty():
         return 1.0
 
     # 2. Re-calculate metrics fully decoupled from UI
-    total_collections = len(preset.collections)
+    is_global = getattr(scene, "batch_stl_info_global", False)
+    target_presets = scene.batch_stl_presets if is_global else ([preset] if preset else [])
+
+    total_collections = 0
     total_objects = 0
     total_preset_combos = 0
 
     global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
-    preset_ovrs = global_ovrs + get_flat_overrides(preset.nodegroups, "PRESET")
 
-    for c in preset.collections:
-        c_ptr = bpy.data.collections.get(c.collection_name)
-        sync_collection_objects(c, c_ptr)
+    for p in target_presets:
+        total_collections += len(p.collections)
+        preset_ovrs = global_ovrs + get_flat_overrides(p.nodegroups, "PRESET")
 
-        if not c_ptr or visibility.get(c.collection_name, True):
-            continue
+        for c in p.collections:
+            c_ptr = bpy.data.collections.get(c.collection_name)
+            sync_collection_objects(c, c_ptr)
 
-        c_pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups, "COLLECTION")
-        for obj_prop in c.objects:
-            if not obj_prop.export: continue
-            bl_obj = c_ptr.all_objects.get(obj_prop.name)
-            if bl_obj and bl_obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not bl_obj.hide_viewport:
-                obj_ovrs = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT")
-                combos = len(generate_override_combinations(obj_ovrs))
-                total_preset_combos += combos
-                total_objects += combos
+            if not c_ptr or visibility.get(c.collection_name, True):
+                continue
+
+            c_pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups, "COLLECTION")
+            for obj_prop in c.objects:
+                if not obj_prop.export: continue
+                bl_obj = c_ptr.all_objects.get(obj_prop.name)
+                if bl_obj and bl_obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not bl_obj.hide_viewport:
+                    obj_ovrs = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT")
+                    combos = len(generate_override_combinations(obj_ovrs))
+                    total_preset_combos += combos
+                    total_objects += combos
 
     _ui_cache["metrics"] = {
         "total_collections": total_collections,
@@ -800,10 +830,13 @@ def rebuild_ui_cache_if_dirty():
     }
 
     # 3. Active collection metrics pre-computation
+    # This always evaluates based on the currently active preset UI context
     active_col = get_active_collection(preset)
     if active_col:
         active_obj = get_active_object(active_col)
-        all_ovrs = preset_ovrs + get_flat_overrides(active_col.nodegroups, "COLLECTION") + (get_flat_overrides(active_obj.nodegroups, "OBJECT") if active_obj else [])
+        # Use active preset's context overrides
+        active_preset_ovrs = global_ovrs + get_flat_overrides(preset.nodegroups, "PRESET") if preset else global_ovrs
+        all_ovrs = active_preset_ovrs + get_flat_overrides(active_col.nodegroups, "COLLECTION") + (get_flat_overrides(active_obj.nodegroups, "OBJECT") if active_obj else [])
         unique_targets = set()
         total_inputs = 0
 
@@ -829,8 +862,8 @@ def rebuild_ui_cache_if_dirty():
     else:
         _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
 
-    # 4. Build visualization tree across all presets
-    tree_dict, duplicates = build_tree_dict(context, visibility)
+    # 4. Build visualization tree across evaluated scope
+    tree_dict, duplicates = build_tree_dict(context, visibility, is_global)
     _ui_cache["tree"] = (tree_dict, duplicates)
 
     if getattr(context, "window_manager", None):
@@ -852,7 +885,7 @@ def batch_stl_depsgraph_handler(scene, depsgraph):
 # --- TREE VISUALIZER LOGIC ---
 # This builds an artificial file-folder structure in memory so the script can
 # visually show you what files will be created and where, before you actually click export.
-def build_tree_dict(context, visibility_cache=None):
+def build_tree_dict(context, visibility_cache=None, is_global=False):
     scene = context.scene
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
     tree = {}
@@ -860,8 +893,10 @@ def build_tree_dict(context, visibility_cache=None):
     duplicates = set()
 
     global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
+    target_presets = scene.batch_stl_presets if is_global else ([get_active_preset(scene)] if get_active_preset(scene) else [])
 
-    for preset in scene.batch_stl_presets:
+    for preset in target_presets:
+        if not preset: continue
         preset_ovrs = get_flat_overrides(preset.nodegroups, "PRESET")
 
         for c in preset.collections:
@@ -1630,11 +1665,17 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
 class BATCH_STL_OT_clear_console(bpy.types.Operator):
     bl_idname = "batch_stl.clear_console"
     bl_label = "Clear Console"
-    bl_description = "Clear all console logs for the active preset"
+    bl_description = "Clear console logs for the current view"
 
     def execute(self, context):
-        preset = get_active_preset(context.scene)
-        if preset: preset.console_logs.clear()
+        scene = context.scene
+        if getattr(scene, "batch_stl_info_global", False):
+            scene.batch_stl_global_console_logs.clear()
+            for p in scene.batch_stl_presets:
+                p.console_logs.clear()
+        else:
+            preset = get_active_preset(scene)
+            if preset: preset.console_logs.clear()
         return {'FINISHED'}
 
 # A multi-purpose operator that can handle moving lists up, down, deleting, and copying.
@@ -2730,21 +2771,81 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         dir_row = dir_col.row(align=True)
         dir_row.operator("batch_stl.import_presets_json", text="", icon='IMPORT')
         dir_row.operator("batch_stl.export_presets_json", text="", icon='EXPORT')
-        dir_row.prop(scene, "batch_stl_show_console", text="", icon='CONSOLE', toggle=True)
+        dir_row.prop(scene, "batch_stl_show_console", text="", icon='INFO', toggle=True)
         dir_row.prop(scene, "batch_stl_root_dir")
 
         active_preset = get_active_preset(scene)
 
         if scene.batch_stl_show_console:
-            c_box = layout.box()
-            c_box.label(text="Console Log", icon='CONSOLE')
-            if active_preset:
-                c_box.template_list("BATCH_STL_UL_console_logs", "", active_preset, "console_logs", active_preset, "console_index", rows=6)
-                clear_col = c_box.column()
+            info_box = layout.box()
+
+            tab_row = info_box.row()
+            tab_row.prop(scene, "batch_stl_info_tab", expand=True)
+            tab_row.prop(scene, "batch_stl_info_global", text="Global", toggle=True, icon='WORLD')
+
+            if scene.batch_stl_info_tab == 'LOG':
+                if scene.batch_stl_info_global:
+                    info_box.template_list("BATCH_STL_UL_console_logs", "", scene, "batch_stl_global_console_logs", scene, "batch_stl_global_console_index", rows=6)
+                else:
+                    if active_preset:
+                        info_box.template_list("BATCH_STL_UL_console_logs", "", active_preset, "console_logs", active_preset, "console_index", rows=6)
+                    else:
+                        info_box.label(text="Select a preset to view logs.")
+
+                clear_col = info_box.column()
                 clear_col.enabled = not any_exporting
                 clear_col.operator("batch_stl.clear_console", text="Clear Log", icon='TRASH')
-            else:
-                c_box.label(text="Select a preset to view logs.")
+
+            elif scene.batch_stl_info_tab == 'TREE':
+                tree_dict, duplicates = _ui_cache.get("tree", ({}, set()))
+                if duplicates:
+                    warn_box = info_box.box()
+                    warn_row = warn_box.row()
+                    warn_row.label(text=f"WARNING: {len(duplicates)} naming collisions detected! Files will be overwritten.", icon='ERROR')
+
+                col = info_box.column(align=True)
+                draw_tree_dict(col, tree_dict, duplicates=duplicates)
+
+            info_box.separator()
+
+            metrics = _ui_cache.get("metrics", {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0})
+            col_metrics = _ui_cache.get("active_col_metrics", {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0})
+
+            stat_box = info_box.box()
+            stat_row = stat_box.row()
+            stat_row.label(text=f"Total Collections: {metrics['total_collections']}", icon='OUTLINER_COLLECTION')
+            stat_row.label(text=f"Total Output Files: {metrics['total_objects']}", icon='FILE_3D')
+
+            stat_row2 = stat_box.row()
+            c_name = col_metrics['c_name'] or 'None'
+            stat_row2.label(text=f"Active Col: {c_name} | {col_metrics['num_targets']} Targets | {col_metrics['mapping_total_objects']} Files", icon='MODIFIER')
+
+            info_box.separator()
+
+            tip_box = info_box.box()
+            tip_header = tip_box.row()
+            icon_tip = 'TRIA_DOWN' if scene.batch_stl_ui_tips else 'TRIA_RIGHT'
+            tip_header.prop(scene, "batch_stl_ui_tips", text="", icon=icon_tip, emboss=False)
+            tip_header.label(text="OVERRIDE INFO", icon='INFO')
+
+            if scene.batch_stl_ui_tips:
+                col = tip_box.column()
+                col.label(text="Hierarchy: Global > Preset > Collection > Object > NodeGroup > Node.", icon='BLANK1')
+                col.label(text="For modifier targets, leave Node blank or set as <Modifier Interface>", icon='BLANK1')
+                col.separator()
+
+                col.label(text="Sweep Mode (Shift-Click '+' button to toggle):", icon='FILE_REFRESH')
+                col.label(text="  • Floats/Ints: Define start, step, and count", icon='BLANK1')
+                col.label(text="  • Menus/Bools: Auto-iterates all values", icon='BLANK1')
+                col.label(text="  • Shift-Click when active to populate all sweep values", icon='BLANK1')
+                col.separator()
+
+                col.label(text="Export Tools (Per Value):", icon='BLANK1')
+                col.label(text="  • Folder Icon: Save this value's exports into a subfolder", icon='FILE_FOLDER')
+                col.label(text="  • Bookmark Icon: Append/Prepend a tag to filename", icon='BOOKMARKS')
+
+                col.label(text="Tag Formatting:", icon='BLANK1')
+                col.label(text="  • [ tag ] replaces input value, [ _tag ] appends, [ tag_ ] prepends", icon='BLANK1')
 
         layout.separator()
 
@@ -2789,15 +2890,13 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         main_col = layout.column()
         main_col.enabled = not any_exporting
 
-        metrics = _ui_cache.get("metrics", {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0})
-
         main_col.separator(factor=0.5)
         m_box = main_col.box()
         m_header = m_box.row()
         icon_m = 'TRIA_DOWN' if scene.batch_stl_ui_collections else 'TRIA_RIGHT'
         m_header.prop(scene, "batch_stl_ui_collections", text="", icon=icon_m, emboss=False)
 
-        m_title = f"Collections in [ {active_preset.name} ] preset | {metrics['total_collections']} collections | {metrics['total_objects']} files"
+        m_title = f"Collections in [ {active_preset.name} ] preset"
         m_header.label(text=m_title, icon='OUTLINER_COLLECTION')
         draw_inline_controls(m_header, "batch_stl.collection_actions", use_clipboard=True)
 
@@ -2826,55 +2925,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             if active_obj:
                 o_box.separator(factor=0.5)
                 draw_overrides_table(o_box, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Overrides for [ {active_obj.name} ] object")
-
-            main_col.separator()
-            col_metrics = _ui_cache.get("active_col_metrics", {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0})
-            metric_str = f"{col_metrics['c_name']} | {col_metrics['num_targets']} targets | {col_metrics['total_inputs']} inputs | {col_metrics['mapping_total_objects']} output files"
-            header = main_col.row()
-            header.label(text=metric_str, icon='MODIFIER')
-            main_col.separator()
-
-            tip_box = main_col.box()
-            tip_header = tip_box.row()
-            icon_tip = 'TRIA_DOWN' if scene.batch_stl_ui_tips else 'TRIA_RIGHT'
-            tip_header.prop(scene, "batch_stl_ui_tips", text="", icon=icon_tip, emboss=False)
-            tip_header.label(text="OVERRIDE INFO", icon='INFO')
-
-            if scene.batch_stl_ui_tips:
-                col = tip_box.column()
-                col.label(text="Hierarchy: Global > Preset > Collection > Object > NodeGroup > Node.", icon='BLANK1')
-                col.label(text="For modifier targets, leave Node blank or set as <Modifier Interface>", icon='BLANK1')
-                col.separator()
-
-                col.label(text="Sweep Mode (Shift-Click '+' button to toggle):", icon='FILE_REFRESH')
-                col.label(text="  • Floats/Ints: Define start, step, and count", icon='BLANK1')
-                col.label(text="  • Menus/Bools: Auto-iterates all values", icon='BLANK1')
-                col.label(text="  • Shift-Click when active to populate all sweep values", icon='BLANK1')
-                col.separator()
-
-                col.label(text="Export Tools (Per Value):", icon='BLANK1')
-                col.label(text="  • Folder Icon: Save this value's exports into a subfolder", icon='FILE_FOLDER')
-                col.label(text="  • Bookmark Icon: Append/Prepend a tag to filename", icon='BOOKMARKS')
-
-                col.label(text="Tag Formatting:", icon='BLANK1')
-                col.label(text="  • [ tag ] replaces input value, [ _tag ] appends, [ tag_ ] prepends", icon='BLANK1')
-
-        main_col.separator()
-        t_box = main_col.box()
-        t_header = t_box.row(align=True)
-        icon_t = 'TRIA_DOWN' if scene.batch_stl_show_tree else 'TRIA_RIGHT'
-        t_header.prop(scene, "batch_stl_show_tree", text="", icon=icon_t, emboss=False)
-        t_header.label(text="Export Structure & Files", icon='OUTLINER_OB_EMPTY')
-
-        if scene.batch_stl_show_tree:
-            tree_dict, duplicates = _ui_cache.get("tree", ({}, set()))
-            if duplicates:
-                warn_box = t_box.box()
-                warn_row = warn_box.row()
-                warn_row.label(text=f"WARNING: {len(duplicates)} naming collisions detected! Files will be overwritten.", icon='ERROR')
-
-            col = t_box.column(align=True)
-            draw_tree_dict(col, tree_dict, duplicates=duplicates)
 
         main_col.separator()
         main_col.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
@@ -2934,8 +2984,9 @@ classes = (
     VIEW3D_PT_batch_export_stl_multi,
 )
 
-def update_show_tree(self, context):
-    if not self.batch_stl_show_tree:
+def update_show_console(self, context):
+    mark_dirty()
+    if not self.batch_stl_show_console:
         self.batch_stl_collapsed_dirs = "[]"
 
 # Tells Blender this add-on exists and gives it the list of classes to initialize.
@@ -2965,9 +3016,21 @@ def register():
     bpy.types.Scene.batch_stl_ui_global_ovr_nested = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_local_ovr_nested = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_tips = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
-    bpy.types.Scene.batch_stl_show_tree = bpy.props.BoolProperty(default=True, update=update_show_tree, options={'SKIP_SAVE'})
-    bpy.types.Scene.batch_stl_show_console = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_show_console = bpy.props.BoolProperty(default=False, update=update_show_console, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_collapsed_dirs = bpy.props.StringProperty(default="[]", options={'SKIP_SAVE'})
+
+    bpy.types.Scene.batch_stl_info_tab = bpy.props.EnumProperty(
+        items=[('LOG', "Console Log", ""), ('TREE', "Tree View", "")],
+        name="Info Tab",
+        default='LOG',
+        options={'SKIP_SAVE'}
+    )
+    bpy.types.Scene.batch_stl_info_global = bpy.props.BoolProperty(
+        name="Global Mode", default=False, update=lambda s, c: mark_dirty(), options={'SKIP_SAVE'}
+    )
+    bpy.types.Scene.batch_stl_global_console_logs = bpy.props.CollectionProperty(type=BatchSTLLogLine)
+    bpy.types.Scene.batch_stl_global_console_index = bpy.props.IntProperty(default=0)
+
 
     is_headless = "--batch-stl-headless" in sys.argv
 
@@ -3003,8 +3066,9 @@ def unregister():
         "batch_stl_global_nodegroups", "batch_stl_ui_global_ovr_main",
         "batch_stl_verbose_console", "batch_stl_ui_presets", "batch_stl_ui_collections", "batch_stl_ui_objects",
         "batch_stl_ui_preset_ovr", "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr",
-        "batch_stl_show_tree", "batch_stl_show_console", "batch_stl_collapsed_dirs",
-        "batch_stl_ui_tips", "batch_stl_ui_global_ovr_nested", "batch_stl_ui_local_ovr_nested"
+        "batch_stl_show_console", "batch_stl_collapsed_dirs",
+        "batch_stl_ui_tips", "batch_stl_ui_global_ovr_nested", "batch_stl_ui_local_ovr_nested",
+        "batch_stl_info_tab", "batch_stl_info_global", "batch_stl_global_console_logs", "batch_stl_global_console_index"
     ]
 
     for prop in properties_to_remove:

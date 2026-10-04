@@ -2581,18 +2581,15 @@ def draw_inline_controls(layout, operator_id, use_clipboard=False):
 
 
 def draw_stats_table(parent_layout, stats_list):
-    col = parent_layout.column(align=True)
-    col.separator(factor=0.5)
-
-    row = col.row(align=True)
+    box = parent_layout.box()
+    
+    row = box.row(align=True)
     row.alignment = 'CENTER'
 
     for i, (val, icon) in enumerate(stats_list):
         if i > 0:
             row.separator(factor=2.0)
         row.label(text=str(val), icon=icon)
-
-    col.separator(factor=0.5)
 
 
 def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text, is_preset=False, is_global=False, is_locked=False):
@@ -2888,20 +2885,24 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         inline_col.enabled = not any_exporting
         draw_inline_controls(inline_col, "batch_stl.preset_actions", use_clipboard=True)
 
-        if scene.batch_stl_ui_presets:
-            p_box.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
+        if scene.batch_stl_ui_presets or active_preset:
+            content_col = p_box.column(align=True)
 
-            # Children Stats Display for Presets Section
-            g_stats = stats.get("global", {"presets": 0, "cols": 0, "objs": 0, "exp": 0})
-            draw_stats_table(p_box, [
-                (g_stats['presets'], ICONS['PRESET']),
-                (g_stats['cols'], ICONS['COLLECTION']),
-                (g_stats['objs'], ICONS['OBJECT']),
-                (g_stats['exp'], ICONS['SWEEP'])
-            ])
+            if scene.batch_stl_ui_presets:
+                list_box = content_col.box()
+                list_box.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
 
-        if active_preset:
-            draw_overrides_table(p_box, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ] preset", is_preset=True, is_locked=active_preset.is_exporting)
+                # Children Stats Display for Presets Section
+                g_stats = stats.get("global", {"presets": 0, "cols": 0, "objs": 0, "exp": 0})
+                draw_stats_table(content_col, [
+                    (g_stats['presets'], ICONS['PRESET']),
+                    (g_stats['cols'], ICONS['COLLECTION']),
+                    (g_stats['objs'], ICONS['OBJECT']),
+                    (g_stats['exp'], ICONS['SWEEP'])
+                ])
+
+            if active_preset:
+                draw_overrides_table(content_col, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ] preset", is_preset=True, is_locked=active_preset.is_exporting)
 
         if not active_preset:
             rest_col = layout.column()
@@ -2923,20 +2924,25 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         m_header.label(text=f"Collections in [ {active_preset.name} ] preset", icon=ICONS['COLLECTION'])
         draw_inline_controls(m_header, "batch_stl.collection_actions", use_clipboard=True)
 
-        if scene.batch_stl_ui_collections:
-            m_box.template_list("BATCH_STL_UL_collections", "", active_preset, "collections", active_preset, "collection_index", rows=5)
-
-            # Children Stats Display for Collections Section
-            p_stats = stats.get("presets", {}).get(active_preset.name, {"cols": 0, "objs": 0, "exp": 0})
-            draw_stats_table(m_box, [
-                (p_stats['cols'], ICONS['COLLECTION']),
-                (p_stats['objs'], ICONS['OBJECT']),
-                (p_stats['exp'], ICONS['SWEEP'])
-            ])
-
         active_col = get_active_collection(active_preset)
-        if active_col:
-            draw_overrides_table(m_box, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides [ {active_col.collection_name or 'Shared'} ]", is_locked=active_preset.is_exporting)
+        
+        if scene.batch_stl_ui_collections or active_col:
+            content_col = m_box.column(align=True)
+
+            if scene.batch_stl_ui_collections:
+                list_box = content_col.box()
+                list_box.template_list("BATCH_STL_UL_collections", "", active_preset, "collections", active_preset, "collection_index", rows=5)
+
+                # Children Stats Display for Collections Section
+                p_stats = stats.get("presets", {}).get(active_preset.name, {"cols": 0, "objs": 0, "exp": 0})
+                draw_stats_table(content_col, [
+                    (p_stats['cols'], ICONS['COLLECTION']),
+                    (p_stats['objs'], ICONS['OBJECT']),
+                    (p_stats['exp'], ICONS['SWEEP'])
+                ])
+
+            if active_col:
+                draw_overrides_table(content_col, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides [ {active_col.collection_name or 'Shared'} ]", is_locked=active_preset.is_exporting)
 
         main_col.separator()
 
@@ -2948,21 +2954,26 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             o_header.prop(scene, "batch_stl_ui_objects", text="", icon=icon_o, emboss=False)
             o_header.label(text=f"Objects in [ {active_col.collection_name or 'Collection'} ] collection", icon=ICONS['OBJECT'])
 
-            if scene.batch_stl_ui_objects:
-                o_box.template_list("BATCH_STL_UL_objects", "", active_col, "objects", active_col, "object_index", rows=5)
-
-                # Children Stats Display for Objects Section
-                c_idx = active_preset.collection_index
-                col_key = f"{active_preset.name}_c{c_idx}"
-                c_stats = stats.get("cols", {}).get(col_key, {"objs": 0, "exp": 0})
-                draw_stats_table(o_box, [
-                    (c_stats['objs'], ICONS['OBJECT']),
-                    (c_stats['exp'], ICONS['SWEEP'])
-                ])
-
             active_obj = get_active_object(active_col)
-            if active_obj:
-                draw_overrides_table(o_box, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Overrides for [ {active_obj.name} ] object", is_locked=active_preset.is_exporting)
+            
+            if scene.batch_stl_ui_objects or active_obj:
+                content_col = o_box.column(align=True)
+                
+                if scene.batch_stl_ui_objects:
+                    list_box = content_col.box()
+                    list_box.template_list("BATCH_STL_UL_objects", "", active_col, "objects", active_col, "object_index", rows=5)
+
+                    # Children Stats Display for Objects Section
+                    c_idx = active_preset.collection_index
+                    col_key = f"{active_preset.name}_c{c_idx}"
+                    c_stats = stats.get("cols", {}).get(col_key, {"objs": 0, "exp": 0})
+                    draw_stats_table(content_col, [
+                        (c_stats['objs'], ICONS['OBJECT']),
+                        (c_stats['exp'], ICONS['SWEEP'])
+                    ])
+
+                if active_obj:
+                    draw_overrides_table(content_col, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Overrides for [ {active_obj.name} ] object", is_locked=active_preset.is_exporting)
 
         main_col.separator()
         main_col.prop(scene, "batch_stl_verbose_console", toggle=True, icon=ICONS['CONSOLE'])

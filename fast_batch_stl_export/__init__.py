@@ -981,7 +981,7 @@ class BatchSTLValue(bpy.types.PropertyGroup):
     use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=mark_dirty)
     tag: bpy.props.StringProperty(name="Tag", default="", update=update_with_undo("Update Value Tag"))
     use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=mark_dirty)
-    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=update_with_undo("Toggle Value Sweep"))
+    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=mark_dirty)
     sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", update=update_with_undo("Update Sweep Range"))
 
 class BatchSTLInput(bpy.types.PropertyGroup):
@@ -1102,6 +1102,17 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
+    @classmethod
+    def description(cls, context, properties):
+        act = properties.action
+        if act == 'ADD': return "Add new preset"
+        if act == 'REMOVE': return "Remove active preset"
+        if act == 'UP': return "Move preset up (Shift: Move to top)"
+        if act == 'DOWN': return "Move preset down (Shift: Move to bottom)"
+        if act == 'COPY': return "Copy active preset"
+        if act == 'PASTE': return "Paste preset from clipboard"
+        return "Preset action"
+
     def invoke(self, context, event):
         self.shift_pressed = event.shift
         return self.execute(context)
@@ -1128,6 +1139,17 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
     bl_options = {'REGISTER', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        act = properties.action
+        if act == 'ADD': return "Add new collection target"
+        if act == 'REMOVE': return "Remove active collection"
+        if act == 'UP': return "Move collection up (Shift: Move to top)"
+        if act == 'DOWN': return "Move collection down (Shift: Move to bottom)"
+        if act == 'COPY': return "Copy active collection target"
+        if act == 'PASTE': return "Paste collection target from clipboard"
+        return "Collection action"
 
     def invoke(self, context, event):
         self.shift_pressed = event.shift
@@ -1162,6 +1184,35 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
     v_idx: bpy.props.IntProperty(default=-1)
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
+    @classmethod
+    def description(cls, context, properties):
+        act = properties.action
+        if act == 'ADD_GROUP': return "Add an Override Group to this level"
+        if act == 'DEL_GROUP': return "Delete this Override Group"
+        if act == 'COPY_GROUP': return "Copy this Override Group to clipboard"
+        if act == 'PASTE_GROUP': return "Paste an Override Group from clipboard"
+        if act == 'MOVE_GROUP_UP': return "Move group up (Shift: Move directly to parent hierarchy level)"
+        if act == 'MOVE_GROUP_DOWN': return "Move group down (Shift: Localize and copy group to every nested child)"
+        if act == 'ADD_NODE': return "Add a Target Node filter"
+        if act == 'DEL_NODE': return "Delete this Target Node filter"
+        if act == 'MOVE_NODE_UP': return "Move Target Node up"
+        if act == 'MOVE_NODE_DOWN': return "Move Target Node down"
+        if act == 'ADD_INPUT': return "Add an Input Parameter override (Shift: Auto-populate all available socket inputs)"
+        if act == 'DEL_INPUT': return "Delete this Input Parameter"
+        if act == 'MOVE_INPUT_UP': return "Move Input Parameter up"
+        if act == 'MOVE_INPUT_DOWN': return "Move Input Parameter down"
+        if act == 'ADD_VALUE': return "Add a Value Permutation iteration"
+        if act == 'DEL_VALUE': return "Delete this Value Permutation"
+        if act == 'DEL_VALUE_OR_INPUT': return "Delete Value (Deletes entire Input if it's the last iteration)"
+        if act == 'MOVE_VALUE_UP': return "Move Value up"
+        if act == 'MOVE_VALUE_DOWN': return "Move Value down"
+        if act == 'VALUE_ACTION': return "Add Permutation (Shift: Toggle Sweep range mode)"
+        if act == 'TOGGLE_VALUE_USE_DIR': return "Toggle sub-directory folder structuring for this iteration"
+        if act == 'TOGGLE_VALUE_USE_TAG': return "Toggle dynamic filename tagging for this iteration"
+        if act == 'TOGGLE_COLLECTION_USE_TAG': return "Toggle collection-level filename prefix/suffix tag"
+        if act == 'TOGGLE_OBJECT_EXPORT': return "Toggle object active export state"
+        return "Perform structural table action"
+
     def invoke(self, context, event):
         self.shift_pressed = event.shift
         return self.execute(context)
@@ -1195,20 +1246,33 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                 if self.is_preset: dst = context.scene.batch_stl_global_nodegroups
                 elif self.is_pinned: dst = preset.nodegroups
                 elif not self.is_global: dst = get_active_collection(preset).nodegroups
-                if 'dst' in locals():
+                if 'dst' in locals() and dst is not None:
                     paste_ng_from_dict(dst.add(), copy_ng_to_dict(src_ng))
                     ng_list.remove(self.ng_idx)
             elif self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
         elif self.action == 'MOVE_GROUP_DOWN':
             if self.shift_pressed:
                 src_ng = ng_list[self.ng_idx]
-                if self.is_global: dst = preset.nodegroups
-                elif self.is_preset: dst = get_active_collection(preset).nodegroups
-                elif self.is_pinned: dst = get_active_object(get_active_collection(preset)).nodegroups
-                if 'dst' in locals() and dst is not None:
-                    paste_ng_from_dict(dst.add(), copy_ng_to_dict(src_ng))
+                copied_data = copy_ng_to_dict(src_ng)
+                pushed = False
+                if self.is_global:
+                    for p in context.scene.batch_stl_presets:
+                        paste_ng_from_dict(p.nodegroups.add(), copied_data)
+                        pushed = True
+                elif self.is_preset:
+                    for c in preset.collections:
+                        paste_ng_from_dict(c.nodegroups.add(), copied_data)
+                        pushed = True
+                elif self.is_pinned:
+                    col = get_active_collection(preset)
+                    if col:
+                        for o in col.objects:
+                            paste_ng_from_dict(o.nodegroups.add(), copied_data)
+                            pushed = True
+                if pushed:
                     ng_list.remove(self.ng_idx)
-            elif self.ng_idx < len(ng_list) - 1: ng_list.move(self.ng_idx, self.ng_idx + 1)
+            elif self.ng_idx < len(ng_list) - 1:
+                ng_list.move(self.ng_idx, self.ng_idx + 1)
 
     def _handle_node_action(self, ng_list):
         nodes = ng_list[self.ng_idx].nodes
@@ -1307,7 +1371,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                 if active_col and 0 <= self.o_idx < len(active_col.objects): active_col.objects[self.o_idx].export = not active_col.objects[self.o_idx].export
             else:
                 ng_list = self._resolve_context_list(context, preset)
-                if not ng_list: return {'CANCELLED'}
+                if ng_list is None: return {'CANCELLED'}
 
                 if self.action == 'TOGGLE_VALUE_USE_DIR': ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_dir = not ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_dir
                 elif self.action == 'TOGGLE_VALUE_USE_TAG': ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_tag = not ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_tag
@@ -1330,6 +1394,7 @@ class BATCH_STL_OT_toggle_dir_tree(bpy.types.Operator):
     bl_idname = "batch_stl.toggle_dir_tree"
     bl_label = "Toggle Directory Tree"
     bl_options = {'INTERNAL'}
+    bl_description = "Toggle directory tree expansion"
     dir_path: bpy.props.StringProperty()
     def execute(self, context):
         scene = context.scene
@@ -1343,6 +1408,7 @@ class BATCH_STL_OT_toggle_dir_tree(bpy.types.Operator):
 class BATCH_STL_OT_cancel_export(bpy.types.Operator):
     bl_idname = "batch_stl.cancel_export"
     bl_label = "Cancel Export"
+    bl_description = "Cancel the active batch export"
     preset_index: bpy.props.IntProperty(default=-1)
     def execute(self, context):
         if 0 <= self.preset_index < len(context.scene.batch_stl_presets):
@@ -1354,6 +1420,7 @@ class BATCH_STL_OT_cancel_export(bpy.types.Operator):
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Export"
+    bl_description = "Start batch STL export"
     bl_options = {"REGISTER"}
     preset_index: bpy.props.IntProperty(default=-1)
 
@@ -1796,6 +1863,7 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
                     clear_col.operator("batch_stl.clear_console", text="Clear Log", icon=ICONS['DEL'])
                 else:
                     info_box.label(text="Select a preset to view logs.", icon=ICONS['INFO'])
+                info_box.prop(scene, "batch_stl_verbose_console", toggle=True, icon=ICONS['CONSOLE'])
 
             elif scene.batch_stl_info_tab == 'TREE':
                 tree_tools = info_box.row()
@@ -1842,12 +1910,7 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
         # Global Overrides
         g_col = layout.column()
         g_col.enabled = not any_exporting
-        g_box = g_col.box()
-        draw_overrides_table(g_box, scene, scene.batch_stl_global_nodegroups, False, "batch_stl_ui_global_ovr_main", "Global Overrides", is_global=True, is_locked=any_exporting)
-
-        layout.separator()
-        layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon=ICONS['CONSOLE'])
-
+        draw_overrides_table(g_col, scene, scene.batch_stl_global_nodegroups, False, "batch_stl_ui_global_ovr_main", "Global Overrides", is_global=True, is_locked=any_exporting)
 
 class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
@@ -1863,7 +1926,10 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
-        row = layout.row()
+
+        layout.separator()
+        row = layout.row(align=True)
+        row.alignment = 'RIGHT'
         row.enabled = not any_exporting
         draw_inline_controls(row, "batch_stl.preset_actions", use_clipboard=True)
 
@@ -1909,7 +1975,10 @@ class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
-        row = layout.row()
+
+        layout.separator()
+        row = layout.row(align=True)
+        row.alignment = 'RIGHT'
         row.enabled = not any_exporting
         draw_inline_controls(row, "batch_stl.collection_actions", use_clipboard=True)
 

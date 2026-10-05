@@ -1844,9 +1844,10 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
         any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
 
         row = layout.row(align=True)
-        row.enabled = not any_exporting
-        row.operator("batch_stl.import_presets_json", text="", icon=ICONS['IMPORT'])
-        row.operator("batch_stl.export_presets_json", text="", icon=ICONS['EXPORT'])
+        sub_row = row.row(align=True)
+        sub_row.enabled = not any_exporting
+        sub_row.operator("batch_stl.import_presets_json", text="", icon=ICONS['IMPORT'])
+        sub_row.operator("batch_stl.export_presets_json", text="", icon=ICONS['EXPORT'])
         row.prop(scene, "batch_stl_show_console", text="", icon=ICONS['INFO'], toggle=True)
         row.separator()
 
@@ -1960,14 +1961,15 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
         active_preset = get_active_preset(scene)
         stats = _ui_cache.get("stats", {})
 
-        layout.enabled = not any_exporting
-
         content_col = layout.column(align=True)
         list_box = content_col.box()
         list_box.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
 
+        locked_col = content_col.column(align=True)
+        locked_col.enabled = not any_exporting
+
         g_stats = stats.get("global", {"presets": 0, "cols": 0, "objs": 0, "exp": 0})
-        draw_stats_table(content_col, [
+        draw_stats_table(locked_col, [
             (g_stats['presets'], ICONS['PRESET']),
             (g_stats['cols'], ICONS['COLLECTION']),
             (g_stats['objs'], ICONS['OBJECT']),
@@ -1975,7 +1977,7 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
         ])
 
         if active_preset:
-            draw_overrides_table(content_col, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ]", is_preset=True, is_locked=active_preset.is_exporting)
+            draw_overrides_table(locked_col, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ]", is_preset=True, is_locked=active_preset.is_exporting)
 
 
 class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):

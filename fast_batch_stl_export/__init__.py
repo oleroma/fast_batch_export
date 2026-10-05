@@ -1327,7 +1327,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         inp_obj = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
         vals = inp_obj.values
         if self.action == 'DEL_VALUE': vals.remove(self.v_idx)
-        elif self.action == 'DEL_VALUE_OR_INPUT':
+        elif self.action == 'DEL_VALUE_MIXED':
             if len(vals) > 1: vals.remove(self.v_idx)
             else: ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
         elif self.action == 'MOVE_VALUE_UP' and self.v_idx > 0: vals.move(self.v_idx, self.v_idx - 1)
@@ -1821,7 +1821,7 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                         if len(node.inputs) > 1:
                             draw_op(c_dir, 'MOVE_INPUT_UP', ICONS['UP'], ng_idx=ng_idx, n_idx=n_idx, i_idx=i_idx)
                             draw_op(c_dir, 'MOVE_INPUT_DOWN', ICONS['DOWN'], ng_idx=ng_idx, n_idx=n_idx, i_idx=i_idx)
-                        draw_op(c_dir, 'DEL_VALUE_OR_INPUT', ICONS['DEL'], ng_idx=ng_idx, n_idx=n_idx, i_idx=i_idx, v_idx=0)
+                        draw_op(c_dir, 'DEL_VALUE_MIXED', ICONS['DEL'], ng_idx=ng_idx, n_idx=n_idx, i_idx=i_idx, v_idx=0)
                     else:
                         if len(inp.values) > 1:
                             draw_op(c_dir, 'MOVE_VALUE_UP', ICONS['UP'], ng_idx=ng_idx, n_idx=n_idx, i_idx=i_idx, v_idx=v_idx)

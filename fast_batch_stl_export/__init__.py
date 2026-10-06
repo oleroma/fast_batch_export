@@ -208,6 +208,12 @@ class MockInput:
         self.use_dir = getattr(source, "use_dir", False)
         self.use_sweep = getattr(source, "use_sweep", False)
         self.sweep_range = getattr(source, "sweep_range", "")
+        self.sweep_start_float = getattr(source, "sweep_start_float", 0.0)
+        self.sweep_step_float = getattr(source, "sweep_step_float", 1.0)
+        self.sweep_count_float = getattr(source, "sweep_count_float", 2)
+        self.sweep_start_int = getattr(source, "sweep_start_int", 0)
+        self.sweep_step_int = getattr(source, "sweep_step_int", 1)
+        self.sweep_count_int = getattr(source, "sweep_count_int", 2)
         self._val = override_val
         self._is_temp = is_temp
 
@@ -253,22 +259,26 @@ def parse_sweep_values(ovr, inp):
         return res if res else [""]
     elif inp.override_type in ['INT', 'FLOAT']:
         vals = []
-        parts = inp.sweep_range.split()
-        if len(parts) >= 3:
-            try:
-                start, step, count = float(parts[0]), float(parts[1]), int(parts[2])
-                if count <= 0:
-                    vals.append(int(start) if inp.override_type == 'INT' else start)
-                else:
-                    for i in range(count):
-                        v = round(start + i * step, 8)
-                        vals.append(int(v) if inp.override_type == 'INT' else v)
-            except (ValueError, TypeError):
-                try: vals.append(int(parts[0]) if inp.override_type == 'INT' else float(parts[0]))
-                except (ValueError, TypeError): vals.append(0 if inp.override_type == 'INT' else 0.0)
+        is_float = (inp.override_type == 'FLOAT')
+        if hasattr(inp, "sweep_count_float" if is_float else "sweep_count_int"):
+            start = getattr(inp, "sweep_start_float" if is_float else "sweep_start_int", 0.0 if is_float else 0)
+            step = getattr(inp, "sweep_step_float" if is_float else "sweep_step_int", 1.0 if is_float else 1)
+            count = getattr(inp, "sweep_count_float" if is_float else "sweep_count_int", 2)
         else:
-            try: vals.append(int(parts[0]) if parts and inp.override_type == 'INT' else float(parts[0]) if parts else 0.0)
-            except (ValueError, TypeError, IndexError): vals.append(0 if inp.override_type == 'INT' else 0.0)
+            parts = getattr(inp, "sweep_range", "").split()
+            try: start = float(parts[0]) if is_float else int(parts[0])
+            except (IndexError, ValueError): start = 0.0 if is_float else 0
+            try: step = float(parts[1]) if is_float else int(parts[1])
+            except (IndexError, ValueError): step = 1.0 if is_float else 1
+            try: count = int(parts[2])
+            except (IndexError, ValueError): count = 1
+
+        if count <= 0:
+            vals.append(round(start, 8) if is_float else int(start))
+        else:
+            for i in range(count):
+                v = round(start + i * step, 8) if is_float else int(start + i * step)
+                vals.append(v)
         return vals
     elif inp.override_type == 'MENU':
         items = get_menu_switch_items(ovr.parent_group_ptr, ovr.node_name, inp.input_name)
@@ -557,7 +567,13 @@ def copy_val_to_dict(v):
         "value_bool": v.value_bool, "value_int": v.value_int, "value_float": v.value_float,
         "value_string": v.value_string, "value_menu": v.value_menu, "use_tag": v.use_tag,
         "tag": v.tag, "use_dir": v.use_dir, "use_sweep": getattr(v, "use_sweep", False),
-        "sweep_range": getattr(v, "sweep_range", "")
+        "sweep_range": getattr(v, "sweep_range", ""),
+        "sweep_start_float": getattr(v, "sweep_start_float", 0.0),
+        "sweep_step_float": getattr(v, "sweep_step_float", 1.0),
+        "sweep_count_float": getattr(v, "sweep_count_float", 2),
+        "sweep_start_int": getattr(v, "sweep_start_int", 0),
+        "sweep_step_int": getattr(v, "sweep_step_int", 1),
+        "sweep_count_int": getattr(v, "sweep_count_int", 2)
     }
 
 def copy_input_to_dict(i):
@@ -617,6 +633,91 @@ def paste_preset_from_dict(new_p, data):
     for ng_data in data.get("nodegroups", []): paste_ng_from_dict(new_p.nodegroups.add(), ng_data)
 
 # --- UI CACHE ENGINE ---
+def is_override_group_valid(ng):
+    if not ng.group_name or not bpy.data.node_groups.get(ng.group_name):
+        return False
+    return True
+
+def is_override_node_valid(ng_ptr, node):
+    if not node.name or node.name == "<Modifier Interface>":
+        return True
+    if not ng_ptr:
+        return False
+    return clean_node_name(node.name) in ng_ptr.nodes
+
+def is_override_input_valid(ng_ptr, node, inp):
+    if not inp.name or not ng_ptr:
+        return False
+    is_mod = not node.name or node.name == "<Modifier Interface>"
+    if is_mod:
+        if hasattr(ng_ptr, "interface"):
+            for item in ng_ptr.interface.items_tree:
+                if getattr(item, "item_type", "") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT' and item.name == inp.name:
+                    return True
+            return False
+        elif hasattr(ng_ptr, "inputs"):
+            return inp.name in ng_ptr.inputs
+        return False
+    target_n = ng_ptr.nodes.get(clean_node_name(node.name))
+    if not target_n:
+        return False
+    return inp.name in target_n.inputs
+
+def is_override_val_valid(inp, val, ng_ptr=None, node=None):
+    if val is None:
+        return False
+    if getattr(val, "use_sweep", False):
+        if inp.override_type == 'FLOAT':
+            return getattr(val, "sweep_count_float", 0) >= 1
+        elif inp.override_type == 'INT':
+            return getattr(val, "sweep_count_int", 0) >= 1
+        elif inp.override_type == 'STRING':
+            return bool(val.sweep_range and val.sweep_range.strip())
+        return True
+    if inp.override_type == 'STRING':
+        return bool(val.value_string and val.value_string.strip())
+    elif inp.override_type == 'MENU':
+        if not (val.value_menu and val.value_menu.strip()):
+            return False
+        if ng_ptr and node:
+            valid_items = get_menu_switch_items(ng_ptr, node.name, inp.name)
+            if valid_items and val.value_menu not in valid_items:
+                return False
+        return True
+    return True
+
+def validate_overrides(nodegroups):
+    for ng in nodegroups:
+        if not is_override_group_valid(ng):
+            return False
+        ng_ptr = bpy.data.node_groups.get(ng.group_name)
+        for node in ng.nodes:
+            if not is_override_node_valid(ng_ptr, node):
+                return False
+            for inp in node.inputs:
+                if not is_override_input_valid(ng_ptr, node, inp):
+                    return False
+                if not inp.values:
+                    return False
+                for val in inp.values:
+                    if not is_override_val_valid(inp, val, ng_ptr, node):
+                        return False
+    return True
+
+def is_preset_setup_valid(scene, preset):
+    if not validate_overrides(scene.batch_stl_global_nodegroups):
+        return False
+    if not validate_overrides(preset.nodegroups):
+        return False
+    for c in preset.collections:
+        if not validate_overrides(c.nodegroups):
+            return False
+        for obj in c.objects:
+            if obj.export:
+                if not validate_overrides(obj.nodegroups):
+                    return False
+    return True
+
 def check_ng_for_overrides(nodegroups):
     has_ovr = len(nodegroups) > 0
     has_perm = any(len(i.values) > 1 or any(getattr(v, "use_sweep", False) for v in i.values) for ng in nodegroups for n in ng.nodes for i in n.inputs)
@@ -951,6 +1052,7 @@ def run_headless_export(job_file_path):
 # ==============================================================================
 
 _state = {"is_importing": False, "is_pasting": False, "is_populating": False, "suppress_undo": False}
+_last_undo_time = 0.0
 
 class suppress_undo:
     _depth = 0
@@ -965,9 +1067,14 @@ class suppress_undo:
 def update_with_undo(action_name):
     def _updater(self, context):
         mark_dirty()
+        global _last_undo_time
         if not any(_state.values()):
-            try: bpy.ops.ed.undo_push(message=action_name)
-            except Exception: pass
+            import time
+            if time.time() - _last_undo_time > 0.1:
+                try: 
+                    bpy.ops.ed.undo_push(message=action_name)
+                    _last_undo_time = time.time()
+                except Exception: pass
     return _updater
 
 class HierarchyIterator:
@@ -1020,9 +1127,15 @@ def on_input_name_update(self, context):
                     with suppress_undo():
                         self.override_type = infer_input_type(ng_ptr, n.name, self.name)
                         for v in self.values: v.use_sweep = False
+                    
+                    global _last_undo_time
                     if not any(_state.values()):
-                        try: bpy.ops.ed.undo_push(message="Update Input Socket Name")
-                        except Exception: pass
+                        import time
+                        if time.time() - _last_undo_time > 0.1:
+                            try:
+                                bpy.ops.ed.undo_push(message="Update Input Socket")
+                                _last_undo_time = time.time()
+                            except Exception: pass
                     return
     except Exception: pass
 
@@ -1056,16 +1169,22 @@ def search_menu_items_cb(self, context, edit_text):
 
 class BatchSTLLogLine(bpy.types.PropertyGroup): text: bpy.props.StringProperty()
 class BatchSTLValue(bpy.types.PropertyGroup):
-    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=mark_dirty)
-    value_int: bpy.props.IntProperty(name="Value", default=0, update=mark_dirty)
-    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=mark_dirty)
-    value_string: bpy.props.StringProperty(name="Value", default="", update=mark_dirty)
-    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=mark_dirty)
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=mark_dirty)
+    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=update_with_undo("Update Boolean Value"))
+    value_int: bpy.props.IntProperty(name="Value", default=0, update=update_with_undo("Update Integer Value"))
+    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=update_with_undo("Update Float Value"))
+    value_string: bpy.props.StringProperty(name="Value", default="", update=update_with_undo("Update String Value"))
+    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=update_with_undo("Update Menu Value"))
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=update_with_undo("Toggle Value Tag"))
     tag: bpy.props.StringProperty(name="Tag", default="", update=update_with_undo("Update Value Tag"))
-    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=mark_dirty)
-    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=mark_dirty)
+    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=update_with_undo("Toggle Value Dir"))
+    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=update_with_undo("Toggle Sweep"))
     sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", update=update_with_undo("Update Sweep Range"))
+    sweep_start_float: bpy.props.FloatProperty(name="Start", default=0.0, update=update_with_undo("Update Sweep Start"))
+    sweep_step_float: bpy.props.FloatProperty(name="Step", default=1.0, update=update_with_undo("Update Sweep Step"))
+    sweep_count_float: bpy.props.IntProperty(name="Steps", default=2, min=1, update=update_with_undo("Update Sweep Steps"))
+    sweep_start_int: bpy.props.IntProperty(name="Start", default=0, update=update_with_undo("Update Sweep Start"))
+    sweep_step_int: bpy.props.IntProperty(name="Step", default=1, update=update_with_undo("Update Sweep Step"))
+    sweep_count_int: bpy.props.IntProperty(name="Steps", default=2, min=1, update=update_with_undo("Update Sweep Steps"))
 
 class BatchSTLInput(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Input Socket", default="", update=on_input_name_update)
@@ -1077,19 +1196,19 @@ class BatchSTLNode(bpy.types.PropertyGroup):
     inputs: bpy.props.CollectionProperty(type=BatchSTLInput)
 
 class BatchSTLNodeGroup(bpy.types.PropertyGroup):
-    group_name: bpy.props.StringProperty(name="Node Group", default="", update=update_with_undo("Update Node Group Name"))
+    group_name: bpy.props.StringProperty(name="Node Group", default="", update=update_with_undo("Update Node Group"))
     nodes: bpy.props.CollectionProperty(type=BatchSTLNode)
 
 class BatchSTLObject(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
-    export: bpy.props.BoolProperty(default=True, update=mark_dirty)
+    export: bpy.props.BoolProperty(default=True, update=update_with_undo("Toggle Object Export"))
     tag: bpy.props.StringProperty(name="Tag", default="", update=update_with_undo("Update Object Tag"))
     sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=update_with_undo("Update Object Sub-folder"))
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
 class BatchSTLCollection(bpy.types.PropertyGroup):
     collection_name: bpy.props.StringProperty(name="Collection", default="", update=update_with_undo("Update Collection Name"))
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, update=mark_dirty)
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, update=update_with_undo("Toggle Collection Tag"))
     tag: bpy.props.StringProperty(name="Tag", default="", update=update_with_undo("Update Collection Tag"))
     sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=update_with_undo("Update Collection Sub-folder"))
     objects: bpy.props.CollectionProperty(type=BatchSTLObject)
@@ -1099,7 +1218,6 @@ class BatchSTLCollection(bpy.types.PropertyGroup):
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Preset Name", default="New Preset", update=update_with_undo("Update Preset Name"))
     preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", update=update_with_undo("Update Preset Prefix"))
-    last_export_time: bpy.props.FloatProperty(name="Last Export Time", default=0.0)
     collections: bpy.props.CollectionProperty(type=BatchSTLCollection)
     collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=update_with_undo("Change Collection Selection"))
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
@@ -1109,6 +1227,7 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
     export_status: bpy.props.StringProperty(default="")
     console_logs: bpy.props.CollectionProperty(type=BatchSTLLogLine)
     console_index: bpy.props.IntProperty(default=0)
+    last_export_time: bpy.props.FloatProperty(name="Last Export Time", default=0.0)
 
 
 # ==============================================================================
@@ -1573,6 +1692,9 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if scene.batch_stl_root_dir.startswith("//") and not bpy.data.is_saved:
             self.report({'ERROR'}, "Please save the .blend file before exporting to a relative path (//)")
             return {"CANCELLED"}
+        if not is_preset_setup_valid(scene, self.preset):
+            self.report({'ERROR'}, "Improper setup: One or more override fields are missing or invalid.")
+            return {"CANCELLED"}
 
         if context.scene.batch_stl_show_console: context.scene.batch_stl_info_tab = 'LOG'
         self.preset.console_logs.clear()
@@ -1821,14 +1943,17 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
     def draw_input_name(parent, inp, ng, node):
         ng_ptr = bpy.data.node_groups.get(ng.group_name)
         is_mod = not node.name or node.name == "<Modifier Interface>"
+        is_valid = is_override_input_valid(ng_ptr, node, inp)
+        row = parent.row(align=True)
+        row.alert = not is_valid
         if is_mod and ng_ptr and hasattr(ng_ptr, "interface"):
-            parent.prop_search(inp, "name", ng_ptr.interface, "items_tree", text="")
+            row.prop_search(inp, "name", ng_ptr.interface, "items_tree", text="")
         elif not is_mod and ng_ptr and node.name:
-            target_n = ng_ptr.nodes.get(node.name.split(" [")[0].strip())
-            if target_n: parent.prop_search(inp, "name", target_n, "inputs", text="")
-            else: parent.prop(inp, "name", text="")
+            target_n = ng_ptr.nodes.get(clean_node_name(node.name))
+            if target_n: row.prop_search(inp, "name", target_n, "inputs", text="")
+            else: row.prop(inp, "name", text="")
         else:
-            parent.prop(inp, "name", text="")
+            row.prop(inp, "name", text="")
 
     box = layout.box()
 
@@ -1863,7 +1988,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
         ng_row = ng_layout.row(align=True)
 
         draw_op(ng_row, 'ADD_NODE', ICONS['ADD'], ng_idx=ng_idx)
-        ng_row.prop_search(ng, "group_name", bpy.data, "node_groups", text="")
+        ng_sub = ng_row.row(align=True)
+        ng_sub.alert = not is_override_group_valid(ng)
+        ng_sub.prop_search(ng, "group_name", bpy.data, "node_groups", text="")
         draw_op(ng_row, 'MOVE_GROUP_UP', ICONS['UP'], ng_idx=ng_idx)
         draw_op(ng_row, 'MOVE_GROUP_DOWN', ICONS['DOWN'], ng_idx=ng_idx)
         draw_op(ng_row, 'COPY_GROUP', ICONS['COPY'], ng_idx=ng_idx)
@@ -1871,6 +1998,8 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
         if not ng.nodes:
             continue
+
+        ng_ptr = bpy.data.node_groups.get(ng.group_name)
 
         n_split = ng_layout.split(factor=0.03)
         n_split.column()
@@ -1884,7 +2013,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
             n_row = node_layout.row(align=True)
             draw_op(n_row, 'ADD_INPUT', ICONS['ADD'], ng_idx=ng_idx, n_idx=n_idx)
-            n_row.prop(node, "name", text="", icon=ICONS['NODE'])
+            n_sub = n_row.row(align=True)
+            n_sub.alert = not is_override_node_valid(ng_ptr, node)
+            n_sub.prop(node, "name", text="", icon=ICONS['NODE'])
 
             if len(ng.nodes) > 1:
                 draw_op(n_row, 'MOVE_NODE_UP', ICONS['UP'], ng_idx=ng_idx, n_idx=n_idx)
@@ -1933,18 +2064,33 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                         continue
 
                     # Render Value Properties
+                    val_valid = is_override_val_valid(inp, val, ng_ptr, node)
+                    c_val_prop = c_val.row(align=True)
+                    c_val_prop.alert = not val_valid
                     if getattr(val, "use_sweep", False):
-                        if inp.override_type in ['INT', 'FLOAT', 'STRING']:
-                            c_val.prop(val, "sweep_range", text="")
+                        if inp.override_type == 'FLOAT':
+                            c_val_prop.prop(val, "sweep_start_float", text="")
+                            c_val_prop.prop(val, "sweep_step_float", text="")
+                            c_val_prop.prop(val, "sweep_count_float", text="")
+                        elif inp.override_type == 'INT':
+                            c_val_prop.prop(val, "sweep_start_int", text="")
+                            c_val_prop.prop(val, "sweep_step_int", text="")
+                            c_val_prop.prop(val, "sweep_count_int", text="")
+                        elif inp.override_type == 'STRING':
+                            c_val_prop.prop(val, "sweep_range", text="")
                         elif inp.override_type in ['BOOLEAN', 'MENU']:
-                            sub = c_val.row(align=True); sub.active = False
-                            sub.operator("wm.context_set_string", text="True & False" if inp.override_type == 'BOOLEAN' else "All values")
+                            sub = c_val_prop.row(align=True); sub.active = False
+                            if inp.override_type == 'BOOLEAN':
+                                sub.operator("wm.context_set_string", text="True & False")
+                            else:
+                                n_items = len(get_menu_switch_items(ng_ptr, node.name, inp.name)) if ng_ptr else 0
+                                sub.operator("wm.context_set_string", text=f"{n_items} values")
                     else:
                         prop_map = {'BOOLEAN': "value_bool", 'INT': "value_int", 'FLOAT': "value_float", 'STRING': "value_string", 'MENU': "value_menu"}
                         prop_name = prop_map.get(inp.override_type)
                         if prop_name:
                             kwargs = {"text": "True" if val.value_bool else "False", "toggle": True} if prop_name == "value_bool" else {"text": ""}
-                            c_val.prop(val, prop_name, **kwargs)
+                            c_val_prop.prop(val, prop_name, **kwargs)
 
                     # Render Directory/Tag controls for permutations
                     is_permutation = len(inp.values) > 1 or any(getattr(v, "use_sweep", False) for v in inp.values)

@@ -62,9 +62,9 @@ Generate variant permutations across any socket:
 ### 8. Dynamic Tagging & Directory Formatting
 * **Sub-Directory Creation (`FILE_FOLDER`):** Route variant exports into dedicated sub-folders per value iteration.
 * **Tagging Rules (`BOOKMARKS`):**
-  - `tag`: Replaces the socket value label entirely (`_tag`).
-  - `tag_`: Prepends the tag to the value (`_tag15`).
-  - `_tag`: Appends the tag to the value (`_15_tag`).
+  - `tag`: Replaces the socket value label entirely (`tag`).
+  - `tag_`: Prepends the tag to the value (`tag_15`).
+  - `_tag`: Appends the tag to the value (`15_tag`).
   - Blank: Defaults to the formatted parameter value.
 
 ### 9. JSON Preset Portability & Clipboard Buffer

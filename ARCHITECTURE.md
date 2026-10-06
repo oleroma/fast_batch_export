@@ -21,7 +21,7 @@
 +---------------------------------------------------------------------------------+
 |                                Blender Main UI                                  |
 |                                                                                 |
-|  [ VIEW3D Panels ] ──> UI Cache Engine (4Hz Timer) ──> Directory Tree / Clashes |
+|  [ VIEW3D Panels ] ──> UI Cache Engine (10Hz Timer) ──> Directory Tree / Clashes |
 |         │                                                                       |
 |         ▼                                                                       |
 |  [ Operator: EXPORT_OT_batch_stl_multi ]                                        |

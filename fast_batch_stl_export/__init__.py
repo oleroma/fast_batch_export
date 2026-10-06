@@ -18,6 +18,7 @@ import tempfile
 import sys
 import struct
 import shutil
+import traceback
 import numpy as np
 
 import bpy
@@ -55,7 +56,8 @@ _ui_cache = {
     "visibility": {},
     "stats": {"global": {"presets": 0, "cols": 0, "objs": 0, "exp": 0}, "presets": {}, "cols": {}},
     "tree": ({}, set()),
-    "preset_metrics": {}
+    "preset_metrics": {},
+    "any_exporting": False,
 }
 
 def mark_dirty(self=None, context=None):
@@ -260,18 +262,9 @@ def parse_sweep_values(ovr, inp):
     elif inp.override_type in ['INT', 'FLOAT']:
         vals = []
         is_float = (inp.override_type == 'FLOAT')
-        if hasattr(inp, "sweep_count_float" if is_float else "sweep_count_int"):
-            start = getattr(inp, "sweep_start_float" if is_float else "sweep_start_int", 0.0 if is_float else 0)
-            step = getattr(inp, "sweep_step_float" if is_float else "sweep_step_int", 1.0 if is_float else 1)
-            count = getattr(inp, "sweep_count_float" if is_float else "sweep_count_int", 2)
-        else:
-            parts = getattr(inp, "sweep_range", "").split()
-            try: start = float(parts[0]) if is_float else int(parts[0])
-            except (IndexError, ValueError): start = 0.0 if is_float else 0
-            try: step = float(parts[1]) if is_float else int(parts[1])
-            except (IndexError, ValueError): step = 1.0 if is_float else 1
-            try: count = int(parts[2])
-            except (IndexError, ValueError): count = 1
+        start = getattr(inp, "sweep_start_float" if is_float else "sweep_start_int", 0.0 if is_float else 0)
+        step = getattr(inp, "sweep_step_float" if is_float else "sweep_step_int", 1.0 if is_float else 1)
+        count = getattr(inp, "sweep_count_float" if is_float else "sweep_count_int", 2)
 
         if count <= 0:
             vals.append(round(start, 8) if is_float else int(start))
@@ -452,6 +445,7 @@ def log_to_console(preset, text):
 def format_export_filename(bl_obj_name, obj_tag, col_use_tag, col_tag, combo_suffix=""):
     safe_name = bpy.path.clean_name(bl_obj_name)
     if obj_tag:
+        # _tag appends, tag_ prepends; a bare tag fully replaces the object name as the filename
         safe_name = f"{safe_name}{obj_tag}" if obj_tag.startswith("_") else (f"{obj_tag}{safe_name}" if obj_tag.endswith("_") else obj_tag)
     tag_suffix = col_tag if col_use_tag and col_tag else ""
     return f"{safe_name}{tag_suffix}{combo_suffix}.stl"
@@ -806,6 +800,7 @@ def rebuild_ui_cache_if_dirty():
             preset_stats[p.name] = {"cols": p_cols, "objs": p_objs, "exp": p_exp}
 
         _ui_cache["stats"] = {"global": {"presets": total_presets, "cols": g_cols, "objs": g_objs, "exp": g_exp}, "presets": preset_stats, "cols": col_stats}
+        _ui_cache["any_exporting"] = any(p.is_exporting for p in scene.batch_stl_presets)
 
         show_console = getattr(scene, "batch_stl_show_console", False)
         info_tab = getattr(scene, "batch_stl_info_tab", 'LOG')
@@ -830,6 +825,11 @@ def rebuild_ui_cache_if_dirty():
                     if area.type == 'VIEW_3D': area.tag_redraw()
         return 0.1
     except Exception:
+        try:
+            if bpy.context.scene.batch_stl_verbose_console:
+                traceback.print_exc()
+        except Exception:
+            pass
         return 0.25
 
 @persistent
@@ -1069,9 +1069,8 @@ def update_with_undo(action_name):
         mark_dirty()
         global _last_undo_time
         if not any(_state.values()):
-            import time
             if time.time() - _last_undo_time > 0.1:
-                try: 
+                try:
                     bpy.ops.ed.undo_push(message=action_name)
                     _last_undo_time = time.time()
                 except Exception: pass
@@ -1130,7 +1129,6 @@ def on_input_name_update(self, context):
                     
                     global _last_undo_time
                     if not any(_state.values()):
-                        import time
                         if time.time() - _last_undo_time > 0.1:
                             try:
                                 bpy.ops.ed.undo_push(message="Update Input Socket")
@@ -1164,7 +1162,6 @@ def search_menu_items_cb(self, context, edit_text):
                     items = get_menu_switch_items(ng_ptr, n.name, i.name)
                     if edit_text == self.value_menu: edit_text = ""
                     return [item for item in items if edit_text.lower() in item.lower()] if edit_text else items
-    return []
     return []
 
 class BatchSTLLogLine(bpy.types.PropertyGroup): text: bpy.props.StringProperty()
@@ -1260,13 +1257,19 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         global _state
         _state["is_importing"] = True
+        before = len(context.scene.batch_stl_presets)
         try:
             with open(self.filepath, 'r', encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, list):
+                self.report({'ERROR'}, "Invalid JSON: expected a list of preset objects.")
+                return {'CANCELLED'}
             for p_data in data:
                 paste_preset_from_dict(context.scene.batch_stl_presets.add(), p_data)
             self.report({'INFO'}, f"Presets imported from {os.path.basename(self.filepath)}")
         except Exception as e:
+            while len(context.scene.batch_stl_presets) > before:
+                context.scene.batch_stl_presets.remove(len(context.scene.batch_stl_presets) - 1)
             self.report({'ERROR'}, f"Failed to import presets: {e}")
             return {'CANCELLED'}
         finally:
@@ -1855,6 +1858,8 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     self.process.kill()
                     self.process.wait(timeout=1.0)
             except Exception: pass
+        if getattr(self, 't', None) and self.t.is_alive():
+            self.t.join(timeout=0.5)
         if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -1864,7 +1869,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
 class BATCH_STL_UL_presets(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        any_exporting = any(p.is_exporting for p in context.scene.batch_stl_presets)
+        any_exporting = _ui_cache.get("any_exporting", False)
         row = layout.row(align=True)
         prop_row = row.row(align=True)
         prop_row.enabled = not any_exporting

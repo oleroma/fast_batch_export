@@ -11,6 +11,8 @@ import os
 import json
 import time
 import itertools
+import math
+import re
 import threading
 import queue
 import subprocess
@@ -62,6 +64,33 @@ _ui_cache = {
 
 def mark_dirty(self=None, context=None):
     _ui_cache["is_dirty"] = True
+
+_INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+def sanitize_name(text):
+    """Make text safe to use inside a single file or folder name on every OS."""
+    return _INVALID_NAME_CHARS.sub("_", str(text))
+
+def split_path_parts(path_text):
+    """Split a user-typed sub-path into safe folder names; empty, '.' and '..' parts are dropped."""
+    if not path_text: return []
+    parts = (sanitize_name(p).strip(" .") for p in re.split(r"[\\/]", path_text))
+    return [p for p in parts if p]
+
+def clash_key(path):
+    """Key for output-path collision checks; Windows and macOS file systems are case-insensitive by default."""
+    norm = os.path.normpath(path)
+    return norm.casefold() if sys.platform in ("win32", "darwin") else norm
+
+def redraw_sidebars(context=None):
+    """Redraw only the 3D viewport sidebars (where this add-on lives), not the whole viewports."""
+    wm = getattr(context or bpy.context, "window_manager", None)
+    if not wm: return
+    for window in wm.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                for region in area.regions:
+                    if region.type == 'UI': region.tag_redraw()
 
 # ==============================================================================
 # === [ 2. CORE LOGIC & ENGINE ] ===
@@ -190,13 +219,43 @@ def get_input_value(inp):
     elif inp.override_type == 'MENU': return inp.value_menu
     return None
 
+# More specific levels win: an Object override replaces the Collection/Preset/Global value of the same socket.
+LEVEL_RANK = {"NONE": -1, "GLOBAL": 0, "PRESET": 1, "COLLECTION": 2, "OBJECT": 3}
+
+def override_param_key(ovr, input_name):
+    """Identity of one overridden socket, independent of the hierarchy level that defines it."""
+    pg_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
+    node = clean_node_name(ovr.node_name) if ovr.override_target == 'NODE' else ""
+    return (ovr.override_target, pg_name, node, input_name)
+
+def resolve_overrides(overrides):
+    """Drop inherited values of a socket whenever a more specific level also defines that socket."""
+    best_rank = {}
+    for ovr in overrides:
+        rank = LEVEL_RANK.get(ovr.level, -1)
+        for inp in ovr.inputs:
+            key = override_param_key(ovr, inp.input_name)
+            best_rank[key] = max(best_rank.get(key, rank), rank)
+
+    resolved = []
+    for ovr in overrides:
+        rank = LEVEL_RANK.get(ovr.level, -1)
+        kept = [inp for inp in ovr.inputs if best_rank[override_param_key(ovr, inp.input_name)] == rank]
+        if kept: resolved.append(MockOverride(ovr.override_target, ovr.parent_group_ptr, ovr.node_name, kept, ovr.level))
+    return resolved
+
 def get_override_signature(overrides):
+    """Hashable fingerprint of everything that decides which variants an object gets and how they are named."""
     sig = []
     for ovr in overrides:
-        target = ovr.override_target
-        pg_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
-        inputs_sig = [(inp.input_name, inp.override_type, get_input_value(inp)) for inp in ovr.inputs]
-        sig.append((target, pg_name, ovr.node_name, tuple(inputs_sig)))
+        inputs_sig = tuple(
+            (inp.input_name, inp.override_type, get_input_value(inp), inp.use_sweep, inp.sweep_range,
+             inp.sweep_start_float, inp.sweep_step_float, inp.sweep_count_float,
+             inp.sweep_start_int, inp.sweep_step_int, inp.sweep_count_int,
+             inp.use_tag, inp.tag, inp.use_dir)
+            for inp in ovr.inputs
+        )
+        sig.append((ovr.level, override_param_key(ovr, ""), inputs_sig))
     return tuple(sig)
 
 class MockInput:
@@ -278,23 +337,27 @@ def parse_sweep_values(ovr, inp):
         return items if items else [""]
     return []
 
-def generate_override_combinations(overrides):
+def _build_override_pools(overrides):
     grouped_inputs = {}
     for ovr in overrides:
-        group_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
         for inp in ovr.inputs:
-            param_key = (ovr.override_target, group_name, ovr.node_name, inp.input_name)
-            grouped_inputs.setdefault(param_key, []).append((ovr, inp))
+            grouped_inputs.setdefault(override_param_key(ovr, inp.input_name), []).append((ovr, inp))
 
     pools = []
-    for param_key, pairs in grouped_inputs.items():
+    for pairs in grouped_inputs.values():
         value_groups = {}
         for ovr, inp in pairs:
             vals_to_process = parse_sweep_values(ovr, inp) if getattr(inp, "use_sweep", False) else [get_input_value(inp)]
             for val in vals_to_process:
                 value_groups.setdefault(val, []).append((ovr, MockInput(inp, val)))
         if value_groups: pools.append(list(value_groups.values()))
+    return pools
 
+def count_override_combinations(overrides):
+    return math.prod(len(pool) for pool in _build_override_pools(overrides))
+
+def generate_override_combinations(overrides):
+    pools = _build_override_pools(overrides)
     if not pools: return [[]]
 
     combinations = list(itertools.product(*pools))
@@ -343,8 +406,17 @@ def capture_baseline_states(overrides, target_objects):
                                 processed_mod_sockets.add(key)
     return global_states, mod_states
 
-def apply_overrides(overrides, target_objects, dry_run=False):
-    trees_to_update = set()
+def menu_value_for_modifier(mod, ident, group, node_name, input_name, value):
+    """Menu inputs can be stored on the modifier as an item number instead of the item name."""
+    current, is_set = get_modifier_input(mod, ident)
+    if not is_set: current = get_modifier_socket_default(group, input_name)
+    if isinstance(current, int) and not isinstance(current, bool):
+        items = get_menu_switch_items(group, node_name, input_name)
+        if value in items: return items.index(value)
+    return value
+
+def apply_overrides(overrides, target_objects):
+    trees_to_update, objects_to_update = set(), set()
     for override in overrides:
         if override.override_target == 'NODE' and override.parent_group_ptr and override.node_name:
             parent_tree = override.parent_group_ptr
@@ -353,19 +425,18 @@ def apply_overrides(overrides, target_objects, dry_run=False):
             for inp in override.inputs:
                 socket = target_node.inputs.get(inp.input_name)
                 if not socket: continue
-                if not dry_run:
-                    if socket.is_linked: parent_tree.links.remove(socket.links[0])
-                    val = get_input_value(inp)
-                    if val is not None:
+                if socket.is_linked: parent_tree.links.remove(socket.links[0])
+                val = get_input_value(inp)
+                if val is not None:
+                    try:
+                        if socket.default_value != val:
+                            socket.default_value = val
+                            trees_to_update.add(parent_tree)
+                    except (TypeError, ValueError):
                         try:
-                            if socket.default_value != val:
-                                socket.default_value = val
-                                trees_to_update.add(parent_tree)
-                        except (TypeError, ValueError):
-                            try:
-                                socket.default_value = (val, val, val)
-                                trees_to_update.add(parent_tree)
-                            except Exception: pass
+                            socket.default_value = (val, val, val)
+                            trees_to_update.add(parent_tree)
+                        except Exception: pass
 
         elif override.override_target == 'MODIFIER' and override.parent_group_ptr:
             for inp in override.inputs:
@@ -375,23 +446,35 @@ def apply_overrides(overrides, target_objects, dry_run=False):
                 for obj in target_objects:
                     for mod in obj.modifiers:
                         if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
-                            if not dry_run:
-                                orig_val, is_set = get_modifier_input(mod, ident)
-                                if not is_set or orig_val != val:
-                                    set_modifier_input(mod, ident, val)
-    if not dry_run:
-        for tree in trees_to_update: tree.update_tag()
+                            mod_val = val
+                            if inp.override_type == 'MENU':
+                                mod_val = menu_value_for_modifier(mod, ident, override.parent_group_ptr, override.node_name, inp.input_name, val)
+                            orig_val, is_set = get_modifier_input(mod, ident)
+                            if not is_set or orig_val != mod_val:
+                                set_modifier_input(mod, ident, mod_val)
+                                objects_to_update.add(obj)
+    for tree in trees_to_update: tree.update_tag()
+    # Setting modifier inputs from Python does not reliably re-evaluate the object, so tag it explicitly.
+    for obj in objects_to_update: obj.update_tag()
 
 def revert_overrides(global_states, mod_states, target_objects):
+    objects_to_update = set()
     for mod, ident, is_set, orig_val, default_val in mod_states:
         try:
             curr_val, curr_is_set = get_modifier_input(mod, ident)
             if is_set and orig_val is not None:
                 is_diff = not curr_is_set or (curr_val != orig_val)
                 if hasattr(is_diff, "__iter__"): is_diff = any(is_diff)
-                if is_diff: set_modifier_input(mod, ident, orig_val)
+                if is_diff:
+                    set_modifier_input(mod, ident, orig_val)
+                    objects_to_update.add(mod.id_data)
             else:
-                if curr_is_set: unset_modifier_input(mod, ident, default_val)
+                if curr_is_set:
+                    unset_modifier_input(mod, ident, default_val)
+                    objects_to_update.add(mod.id_data)
+        except (ReferenceError, Exception): pass
+    for obj in objects_to_update:
+        try: obj.update_tag()
         except (ReferenceError, Exception): pass
 
     trees_to_update = set()
@@ -432,29 +515,21 @@ def log_to_console(preset, text):
         if len(preset.console_logs) > 300:
             preset.console_logs.remove(0)
             preset.console_index = len(preset.console_logs) - 1
-    try:
-        scene = bpy.context.scene
-        g_log = scene.batch_stl_global_console_logs.add()
-        g_log.text = f"[{preset.name}] {text}" if preset else text
-        scene.batch_stl_global_console_index = len(scene.batch_stl_global_console_logs) - 1
-        if len(scene.batch_stl_global_console_logs) > 1000:
-            scene.batch_stl_global_console_logs.remove(0)
-            scene.batch_stl_global_console_index = len(scene.batch_stl_global_console_logs) - 1
-    except Exception: pass
 
 def format_export_filename(bl_obj_name, obj_tag, col_use_tag, col_tag, combo_suffix=""):
     safe_name = bpy.path.clean_name(bl_obj_name)
+    obj_tag = sanitize_name(obj_tag)
     if obj_tag:
         # _tag appends, tag_ prepends; a bare tag fully replaces the object name as the filename
         safe_name = f"{safe_name}{obj_tag}" if obj_tag.startswith("_") else (f"{obj_tag}{safe_name}" if obj_tag.endswith("_") else obj_tag)
-    tag_suffix = col_tag if col_use_tag and col_tag else ""
+    tag_suffix = sanitize_name(col_tag) if col_use_tag and col_tag else ""
     return f"{safe_name}{tag_suffix}{combo_suffix}.stl"
 
 def build_export_dir_parts(preset_prefix, col_sub_path, obj_sub_path, paths_by_level=None):
     if paths_by_level is None: paths_by_level = {}
-    c_parts = [p for p in col_sub_path.replace('\\', '/').split('/') if p] if col_sub_path else []
-    o_parts = [p for p in obj_sub_path.replace('\\', '/').split('/') if p] if obj_sub_path else []
-    p_prefix = [preset_prefix] if preset_prefix else []
+    c_parts = split_path_parts(col_sub_path)
+    o_parts = split_path_parts(obj_sub_path)
+    p_prefix = split_path_parts(preset_prefix)
     return (
         paths_by_level.get("GLOBAL", []) +
         p_prefix +
@@ -469,9 +544,8 @@ def build_export_dir_parts(preset_prefix, col_sub_path, obj_sub_path, paths_by_l
 def compute_override_freq_dict(overrides):
     freq_dict = {}
     for o in overrides:
-        group_name = o.parent_group_ptr.name if getattr(o, "parent_group_ptr", None) else ""
         for i in o.inputs:
-            key = (o.override_target, group_name, o.node_name, i.input_name)
+            key = override_param_key(o, i.input_name)
             freq_dict[key] = freq_dict.get(key, 0) + (2 if getattr(i, "use_sweep", False) else 1)
     return freq_dict
 
@@ -481,16 +555,17 @@ def evaluate_combo_naming(combo, freq_dict):
     processed_params = set()
 
     for ovr, inp in combo:
-        pg_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
-        param_key = (ovr.override_target, pg_name, ovr.node_name, inp.input_name)
+        param_key = override_param_key(ovr, inp.input_name)
         if param_key not in processed_params:
             val = get_input_value(inp)
             val_str = f"{val:g}" if isinstance(val, float) else str(val)
             naming_str = f"{val_str}{inp.tag}" if inp.tag.startswith("_") else (f"{inp.tag}{val_str}" if inp.tag.endswith("_") else inp.tag) if inp.tag else val_str
+            naming_str = sanitize_name(naming_str)
 
             if freq_dict.get(param_key, 0) > 1:
                 if getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
-                if getattr(inp, "use_dir", False): paths_by_level[getattr(ovr, "level", "NONE")].append(naming_str)
+                dir_part = naming_str.strip(" .")
+                if getattr(inp, "use_dir", False) and dir_part: paths_by_level[getattr(ovr, "level", "NONE")].append(dir_part)
             processed_params.add(param_key)
     return combo_suffix, paths_by_level
 
@@ -511,12 +586,11 @@ def sync_collection_objects(col_prop, col_ptr=None):
             new_obj.export = True
 
 # --- BINARY STL WRITER ---
-def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
-    t_start = time.perf_counter()
-    if not mesh: return
+def mesh_to_stl_array(mesh, matrix_world):
+    """Return the mesh as a world-space STL record array, or None when it has no triangles."""
     mesh.calc_loop_triangles()
     num_tris = len(mesh.loop_triangles)
-    if num_tris == 0 or len(mesh.vertices) == 0: return
+    if num_tris == 0 or len(mesh.vertices) == 0: return None
 
     verts = np.empty((len(mesh.vertices), 3), dtype=np.float32)
     mesh.vertices.foreach_get("co", verts.ravel())
@@ -548,12 +622,51 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
     else:
         data['v1'] = verts[tri_verts[:, 1]]
         data['v2'] = verts[tri_verts[:, 2]]
+    return data
 
+def collect_instance_arrays(depsgraph, target_objects):
+    """One pass over the depsgraph instances (e.g. unrealized Geometry Nodes instances) generated by target_objects.
+    Returns {object name_full: [STL arrays]}; instance data is only valid while iterating, so it is converted immediately."""
+    wanted = {obj.name_full for obj in target_objects}
+    result = {}
+    if not wanted: return result
+    for inst in depsgraph.object_instances:
+        if not inst.is_instance or not inst.parent: continue
+        parent_name = inst.parent.original.name_full
+        if parent_name not in wanted: continue
+        inst_obj = inst.object
+        try: mesh = inst_obj.to_mesh()
+        except RuntimeError: continue
+        if not mesh: continue
+        try:
+            arr = mesh_to_stl_array(mesh, inst.matrix_world)
+        finally:
+            inst_obj.to_mesh_clear()
+        if arr is not None: result.setdefault(parent_name, []).append(arr)
+    return result
+
+def write_object_stl(filepath, bl_obj, depsgraph, instance_arrays=()):
+    """Write the evaluated object (plus its pre-collected instances) as one binary STL. Returns the triangle count."""
+    arrays = []
+    obj_eval = bl_obj.evaluated_get(depsgraph)
+    try: mesh = obj_eval.to_mesh()
+    except RuntimeError: mesh = None
+    if mesh:
+        try:
+            arr = mesh_to_stl_array(mesh, obj_eval.matrix_world)
+        finally:
+            obj_eval.to_mesh_clear()
+        if arr is not None: arrays.append(arr)
+    arrays.extend(instance_arrays)
+
+    num_tris = sum(len(a) for a in arrays)
+    if num_tris == 0: return 0
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     with open(filepath, 'wb') as f:
         f.write(STL_HEADER)
         f.write(struct.pack('<I', num_tris))
-        data.tofile(f)
+        for a in arrays: a.tofile(f)
+    return num_tris
 
 # --- JSON UTILS ---
 def copy_val_to_dict(v):
@@ -658,7 +771,7 @@ def is_override_input_valid(ng_ptr, node, inp):
     return inp.name in target_n.inputs
 
 def is_override_val_valid(inp, val, ng_ptr=None, node=None):
-    if val is None:
+    if val is None or inp.override_type not in SUPPORTED_OVERRIDE_TYPES:
         return False
     if getattr(val, "use_sweep", False):
         if inp.override_type == 'FLOAT':
@@ -749,9 +862,9 @@ def rebuild_ui_cache_if_dirty():
 
         gho, ghp = check_ng_for_overrides(scene.batch_stl_global_nodegroups)
         preset_metrics = {}
-        for p in scene.batch_stl_presets:
+        for p_idx, p in enumerate(scene.batch_stl_presets):
             ho, hp = _get_preset_status(scene, p, gho, ghp)
-            preset_metrics[p.name] = {"has_ovr": ho, "has_perm": hp}
+            preset_metrics[p_idx] = {"has_ovr": ho, "has_perm": hp}
         _ui_cache["preset_metrics"] = preset_metrics
 
         visibility = {}
@@ -772,14 +885,13 @@ def rebuild_ui_cache_if_dirty():
 
         global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
 
-        for p in scene.batch_stl_presets:
+        for p_idx, p in enumerate(scene.batch_stl_presets):
             p_cols, p_objs, p_exp = len(p.collections), 0, 0
             preset_ovrs = global_ovrs + get_flat_overrides(p.nodegroups, "PRESET")
 
             for c_idx, c in enumerate(p.collections):
                 c_ptr = bpy.data.collections.get(c.collection_name)
-                with suppress_undo():
-                    sync_collection_objects(c, c_ptr)
+                sync_collection_objects(c, c_ptr)
                 c_objs, c_exp = 0, 0
 
                 if c_ptr and not visibility.get(c.collection_name, True):
@@ -790,14 +902,14 @@ def rebuild_ui_cache_if_dirty():
                         if bl_obj and bl_obj.type in SUPPORTED_OBJECT_TYPES and not bl_obj.hide_viewport:
                             c_objs += 1
                             p_objs += 1
-                            obj_ovrs = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT")
-                            c_exp += len(generate_override_combinations(obj_ovrs))
+                            obj_ovrs = resolve_overrides(c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT"))
+                            c_exp += count_override_combinations(obj_ovrs)
 
                 p_exp += c_exp
-                col_stats[f"{p.name}_c{c_idx}"] = {"objs": c_objs, "exp": c_exp}
+                col_stats[(p_idx, c_idx)] = {"objs": c_objs, "exp": c_exp}
 
             g_cols += p_cols; g_objs += p_objs; g_exp += p_exp
-            preset_stats[p.name] = {"cols": p_cols, "objs": p_objs, "exp": p_exp}
+            preset_stats[p_idx] = {"cols": p_cols, "objs": p_objs, "exp": p_exp}
 
         _ui_cache["stats"] = {"global": {"presets": total_presets, "cols": g_cols, "objs": g_objs, "exp": g_exp}, "presets": preset_stats, "cols": col_stats}
         _ui_cache["any_exporting"] = any(p.is_exporting for p in scene.batch_stl_presets)
@@ -806,10 +918,7 @@ def rebuild_ui_cache_if_dirty():
         info_tab = getattr(scene, "batch_stl_info_tab", 'LOG')
 
         if not show_console or info_tab != 'TREE':
-            if getattr(context, "window_manager", None):
-                for window in context.window_manager.windows:
-                    for area in window.screen.areas:
-                        if area.type == 'VIEW_3D': area.tag_redraw()
+            redraw_sidebars(context)
             return 0.1
 
         is_global = getattr(scene, "batch_stl_info_global", False)
@@ -819,10 +928,7 @@ def rebuild_ui_cache_if_dirty():
         else:
             _ui_cache["tree"] = build_tree_dict(context, visibility, is_global)
 
-        if getattr(context, "window_manager", None):
-            for window in context.window_manager.windows:
-                for area in window.screen.areas:
-                    if area.type == 'VIEW_3D': area.tag_redraw()
+        redraw_sidebars(context)
         return 0.1
     except Exception:
         try:
@@ -864,7 +970,7 @@ def build_tree_dict(context, visibility_cache=None, is_global=False):
                 if not bl_obj or bl_obj.hide_viewport or bl_obj.type not in SUPPORTED_OBJECT_TYPES: continue
 
                 obj_ovrs = get_flat_overrides(obj_prop.nodegroups, "OBJECT")
-                all_overrides = global_ovrs + preset_ovrs + col_ovrs + obj_ovrs
+                all_overrides = resolve_overrides(global_ovrs + preset_ovrs + col_ovrs + obj_ovrs)
 
                 freq_dict = compute_override_freq_dict(all_overrides)
                 combinations = generate_override_combinations(all_overrides) or [[]]
@@ -880,11 +986,11 @@ def build_tree_dict(context, visibility_cache=None, is_global=False):
                     filename = format_export_filename(bl_obj.name, obj_prop.tag, getattr(c, 'use_tag', False), c.tag, combo_suffix)
                     combo_root.setdefault('_files', []).append(filename)
 
-                    full_path = os.path.normpath(os.path.join(root_name, *full_dir_parts, filename))
-                    if full_path in all_filepaths:
-                        duplicates.add(full_path)
+                    full_path_key = clash_key(os.path.join(root_name, *full_dir_parts, filename))
+                    if full_path_key in all_filepaths:
+                        duplicates.add(full_path_key)
                     else:
-                        all_filepaths.add(full_path)
+                        all_filepaths.add(full_path_key)
 
     return {root_name: tree}, duplicates
 
@@ -898,7 +1004,9 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
     for k in dirs:
         dir_path = f"{current_path}/{k}"
         next_actual = os.path.normpath(os.path.join(actual_path, k)) if actual_path else os.path.normpath(k)
-        is_collapsed = dir_path not in toggled_list if k != dirs[-1] else dir_path in toggled_list
+        # The root folder starts expanded and everything below it collapsed; a click on the arrow flips that default.
+        expanded_by_default = (current_path == "")
+        is_collapsed = (dir_path in toggled_list) if expanded_by_default else (dir_path not in toggled_list)
 
         split = layout.split(factor=0.005)
         split.column()
@@ -918,12 +1026,11 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
         row = col.row()
         row.scale_y = 0.4
         check_path = os.path.normpath(os.path.join(actual_path, f)) if actual_path else os.path.normpath(f)
-        if check_path in duplicates: row.alert = True
+        if clash_key(check_path) in duplicates: row.alert = True
         row.label(text=str(f))
 
 # --- HEADLESS EXPORT EXECUTION ROUTINE ---
 def run_headless_export(job_file_path):
-    t_start = time.perf_counter()
     try:
         with open(job_file_path, 'r', encoding="utf-8") as f: job_data = json.load(f)
         preset_index, root_dir, start_time_unix, skip_direct = job_data["preset_index"], job_data["root_dir"], job_data.get("start_time", time.time()), job_data.get("skip_direct", False)
@@ -940,22 +1047,25 @@ def run_headless_export(job_file_path):
     print("\n  [Phase 0] Evaluating Targets and Building Depsgraph Culling Maps...", flush=True)
     t_phase0_start = time.perf_counter()
 
-    execution_batches = {}
-    sig_preset = get_override_signature(get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL") + get_flat_overrides(preset.nodegroups, "PRESET"))
+    # Objects whose effective overrides are identical share one batch (one set of variants, one depsgraph pass).
+    execution_batches, batch_overrides = {}, {}
+    preset_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL") + get_flat_overrides(preset.nodegroups, "PRESET")
 
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
         if not c_ptr or is_collection_excluded(bpy.context, c_ptr): continue
-        sig_pinned = sig_preset + get_override_signature(get_flat_overrides(c.nodegroups, "COLLECTION"))
+        pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups, "COLLECTION")
 
         for obj_prop in c.objects:
             if not obj_prop.export: continue
             bl_obj = c_ptr.all_objects.get(obj_prop.name)
             if not bl_obj or bl_obj.hide_viewport or bl_obj.type not in SUPPORTED_OBJECT_TYPES: continue
 
-            full_sig = sig_pinned + get_override_signature(get_flat_overrides(obj_prop.nodegroups, "OBJECT"))
+            obj_overrides = resolve_overrides(pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT"))
+            full_sig = get_override_signature(obj_overrides)
             if not full_sig and skip_direct: continue
             execution_batches.setdefault(full_sig, []).append((c, obj_prop, bl_obj))
+            batch_overrides.setdefault(full_sig, obj_overrides)
 
     layer_collection_map, layer_collection_parents = {}, {}
     def map_layer_collections(lc, parent=None):
@@ -971,17 +1081,16 @@ def run_headless_export(job_file_path):
         print("  └─ No active objects to export.\nBATCH_STL_DONE", flush=True)
         sys.exit(0)
 
-    total_ops = sum(len(items) * len(generate_override_combinations(get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL") + get_flat_overrides(preset.nodegroups, "PRESET") + get_flat_overrides(items[0][0].nodegroups, "COLLECTION") + get_flat_overrides(items[0][1].nodegroups, "OBJECT"))) for items in execution_batches.values())
+    batch_combinations = {sig: generate_override_combinations(ovrs) for sig, ovrs in batch_overrides.items()}
+    total_ops = sum(len(items) * len(batch_combinations[sig]) for sig, items in execution_batches.items())
     print(f"BATCH_STL_TOTAL:{total_ops}", flush=True)
 
     current_op_step, batch_counter, first_export_started = 0, 1, False
 
     for signature, batch_items in execution_batches.items():
-        first_c, first_obj_prop, _ = batch_items[0]
-        all_overrides = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL") + get_flat_overrides(preset.nodegroups, "PRESET") + get_flat_overrides(first_c.nodegroups, "COLLECTION") + get_flat_overrides(first_obj_prop.nodegroups, "OBJECT")
-
+        all_overrides = batch_overrides[signature]
         freq_dict = compute_override_freq_dict(all_overrides)
-        combinations = generate_override_combinations(all_overrides)
+        combinations = batch_combinations[signature]
         batch_objects = {item[2] for item in batch_items}
 
         isolated_collections = []
@@ -1013,6 +1122,7 @@ def run_headless_export(job_file_path):
                 apply_overrides(reconstruct_overrides_for_combo(combo), batch_objects)
                 bpy.context.view_layer.update()
                 depsgraph = bpy.context.evaluated_depsgraph_get()
+                instance_arrays = collect_instance_arrays(depsgraph, batch_objects)
 
                 for c, obj_prop, bl_obj in batch_items:
                     full_dir_parts = build_export_dir_parts(preset.preset_prefix, c.sub_path, obj_prop.sub_path, paths_by_level)
@@ -1022,17 +1132,10 @@ def run_headless_export(job_file_path):
                     filename = format_export_filename(bl_obj.name, obj_prop.tag, getattr(c, 'use_tag', False), c.tag, combo_suffix)
                     filepath = os.path.join(out_dir, filename)
 
-                    obj_eval = bl_obj.evaluated_get(depsgraph)
-                    try: mesh = obj_eval.to_mesh()
-                    except RuntimeError: mesh = None
+                    num_tris = write_object_stl(filepath, bl_obj, depsgraph, instance_arrays.get(bl_obj.name_full, ()))
+                    result_text = filepath if num_tris else f"SKIPPED (no geometry): {filepath}"
 
-                    if mesh:
-                        try:
-                            write_fast_binary_stl(filepath, mesh, obj_eval.matrix_world, verbose=False)
-                        finally:
-                            obj_eval.to_mesh_clear()
-
-                    print(f"{preset.name} | {c.collection_name} | {bl_obj.name} | Permutation {combo_idx + 1}/{len(combinations)} | Batch {batch_counter}/{len(execution_batches)}\n  └─ {filepath} | {time.perf_counter() - t_perm_start:.2f} s", flush=True)
+                    print(f"{preset.name} | {c.collection_name} | {bl_obj.name} | Permutation {combo_idx + 1}/{len(combinations)} | Batch {batch_counter}/{len(execution_batches)}\n  └─ {result_text} | {time.perf_counter() - t_perm_start:.2f} s", flush=True)
                     current_op_step += 1
                     print(f"BATCH_STL_PROGRESS:{current_op_step}", flush=True)
 
@@ -1051,30 +1154,8 @@ def run_headless_export(job_file_path):
 # === [ 3. PROPERTY GROUPS ] ===
 # ==============================================================================
 
-_state = {"is_importing": False, "is_pasting": False, "is_populating": False, "suppress_undo": False}
-_last_undo_time = 0.0
-
-class suppress_undo:
-    _depth = 0
-    def __enter__(self):
-        suppress_undo._depth += 1
-        _state["suppress_undo"] = True
-        return self
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        suppress_undo._depth = max(0, suppress_undo._depth - 1)
-        _state["suppress_undo"] = (suppress_undo._depth > 0)
-
-def update_with_undo(action_name):
-    def _updater(self, context):
-        mark_dirty()
-        global _last_undo_time
-        if not any(_state.values()):
-            if time.time() - _last_undo_time > 0.1:
-                try:
-                    bpy.ops.ed.undo_push(message=action_name)
-                    _last_undo_time = time.time()
-                except Exception: pass
-    return _updater
+# Undo: Blender already records an undo step for every property edited in the UI, and the
+# operators below declare 'UNDO' in bl_options, so property updates only need to refresh the UI cache.
 
 class HierarchyIterator:
     """Helper to yield all active node groups in the hierarchy context."""
@@ -1091,29 +1172,31 @@ class HierarchyIterator:
         if not obj: return
         for ng in obj.nodegroups: yield ('OBJECT', ng)
 
+SUPPORTED_OVERRIDE_TYPES = ('FLOAT', 'INT', 'BOOLEAN', 'STRING', 'MENU')
+
+def classify_socket_type(socket_type):
+    """Map a node socket / interface socket type to an override type; 'UNSUPPORTED' for vectors, colors, objects, ..."""
+    if socket_type in ('VALUE', 'FLOAT') or 'Float' in socket_type: return 'FLOAT'
+    if socket_type == 'INT' or socket_type.startswith('NodeSocketInt') and 'Vector' not in socket_type: return 'INT'
+    if socket_type == 'BOOLEAN' or 'Bool' in socket_type: return 'BOOLEAN'
+    if socket_type == 'STRING' or 'String' in socket_type: return 'STRING'
+    if socket_type == 'MENU' or 'Menu' in socket_type: return 'MENU'
+    return 'UNSUPPORTED'
+
 def infer_input_type(group_ptr, node_name, input_name):
     if not group_ptr or not input_name: return 'FLOAT'
     if not node_name or node_name == "<Modifier Interface>":
         if hasattr(group_ptr, "interface"):
-            item = group_ptr.interface.items_tree.get(input_name)
-            if not item:
-                for it in group_ptr.interface.items_tree:
-                    if getattr(it, "item_type", "") == 'SOCKET' and getattr(it, "in_out", "INPUT") == 'INPUT' and it.name == input_name:
-                        item = it
-                        break
-            if item:
-                s_type = getattr(item, "socket_type", "")
-                return 'FLOAT' if 'Float' in s_type else 'INT' if 'Int' in s_type else 'BOOLEAN' if 'Bool' in s_type else 'STRING' if 'String' in s_type else 'MENU' if 'Menu' in s_type else 'FLOAT'
+            for it in group_ptr.interface.items_tree:
+                if getattr(it, "item_type", "") == 'SOCKET' and getattr(it, "in_out", "INPUT") == 'INPUT' and it.name == input_name:
+                    return classify_socket_type(getattr(it, "socket_type", ""))
         elif hasattr(group_ptr, "inputs"):
             inp = group_ptr.inputs.get(input_name)
-            if inp:
-                t = inp.type
-                return 'FLOAT' if t in ['VALUE', 'FLOAT'] else ('INT' if t == 'INT' else 'BOOLEAN' if t == 'BOOLEAN' else 'STRING' if t == 'STRING' else 'MENU' if t == 'MENU' else 'FLOAT')
+            if inp: return classify_socket_type(inp.type)
     else:
         node = group_ptr.nodes.get(clean_node_name(node_name))
         if node and input_name in node.inputs:
-            s_type = node.inputs[input_name].type
-            return 'FLOAT' if s_type in ['VALUE', 'FLOAT'] else ('INT' if s_type == 'INT' else 'BOOLEAN' if s_type == 'BOOLEAN' else 'STRING' if s_type == 'STRING' else 'MENU' if s_type == 'MENU' else 'FLOAT')
+            return classify_socket_type(node.inputs[input_name].type)
     return 'FLOAT'
 
 def on_input_name_update(self, context):
@@ -1123,17 +1206,8 @@ def on_input_name_update(self, context):
             for n in ng.nodes:
                 if self in n.inputs.values():
                     ng_ptr = bpy.data.node_groups.get(ng.group_name)
-                    with suppress_undo():
-                        self.override_type = infer_input_type(ng_ptr, n.name, self.name)
-                        for v in self.values: v.use_sweep = False
-                    
-                    global _last_undo_time
-                    if not any(_state.values()):
-                        if time.time() - _last_undo_time > 0.1:
-                            try:
-                                bpy.ops.ed.undo_push(message="Update Input Socket")
-                                _last_undo_time = time.time()
-                            except Exception: pass
+                    self.override_type = infer_input_type(ng_ptr, n.name, self.name)
+                    for v in self.values: v.use_sweep = False
                     return
     except Exception: pass
 
@@ -1166,57 +1240,57 @@ def search_menu_items_cb(self, context, edit_text):
 
 class BatchSTLLogLine(bpy.types.PropertyGroup): text: bpy.props.StringProperty()
 class BatchSTLValue(bpy.types.PropertyGroup):
-    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=update_with_undo("Update Boolean Value"))
-    value_int: bpy.props.IntProperty(name="Value", default=0, update=update_with_undo("Update Integer Value"))
-    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=update_with_undo("Update Float Value"))
-    value_string: bpy.props.StringProperty(name="Value", default="", update=update_with_undo("Update String Value"))
-    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=update_with_undo("Update Menu Value"))
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=update_with_undo("Toggle Value Tag"))
-    tag: bpy.props.StringProperty(name="Tag", default="", update=update_with_undo("Update Value Tag"))
-    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=update_with_undo("Toggle Value Dir"))
-    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=update_with_undo("Toggle Sweep"))
-    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", update=update_with_undo("Update Sweep Range"))
-    sweep_start_float: bpy.props.FloatProperty(name="Start", default=0.0, update=update_with_undo("Update Sweep Start"))
-    sweep_step_float: bpy.props.FloatProperty(name="Step", default=1.0, update=update_with_undo("Update Sweep Step"))
-    sweep_count_float: bpy.props.IntProperty(name="Steps", default=2, min=1, update=update_with_undo("Update Sweep Steps"))
-    sweep_start_int: bpy.props.IntProperty(name="Start", default=0, update=update_with_undo("Update Sweep Start"))
-    sweep_step_int: bpy.props.IntProperty(name="Step", default=1, update=update_with_undo("Update Sweep Step"))
-    sweep_count_int: bpy.props.IntProperty(name="Steps", default=2, min=1, update=update_with_undo("Update Sweep Steps"))
+    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=mark_dirty)
+    value_int: bpy.props.IntProperty(name="Value", default=0, update=mark_dirty)
+    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=mark_dirty)
+    value_string: bpy.props.StringProperty(name="Value", default="", update=mark_dirty)
+    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=mark_dirty)
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=mark_dirty)
+    tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
+    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=mark_dirty)
+    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=mark_dirty)
+    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", update=mark_dirty)
+    sweep_start_float: bpy.props.FloatProperty(name="Start", default=0.0, update=mark_dirty)
+    sweep_step_float: bpy.props.FloatProperty(name="Step", default=1.0, update=mark_dirty)
+    sweep_count_float: bpy.props.IntProperty(name="Steps", default=2, min=1, update=mark_dirty)
+    sweep_start_int: bpy.props.IntProperty(name="Start", default=0, update=mark_dirty)
+    sweep_step_int: bpy.props.IntProperty(name="Step", default=1, update=mark_dirty)
+    sweep_count_int: bpy.props.IntProperty(name="Steps", default=2, min=1, update=mark_dirty)
 
 class BatchSTLInput(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Input Socket", default="", update=on_input_name_update)
-    override_type: bpy.props.StringProperty(default='FLOAT', update=update_with_undo("Update Override Type"))
+    override_type: bpy.props.StringProperty(default='FLOAT', update=mark_dirty)
     values: bpy.props.CollectionProperty(type=BatchSTLValue)
 
 class BatchSTLNode(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Target Node", default="<Modifier Interface>", search=search_target_node_cb, update=update_with_undo("Update Target Node"), description="Select <Modifier Interface> to target the modifier directly")
+    name: bpy.props.StringProperty(name="Target Node", default="<Modifier Interface>", search=search_target_node_cb, update=mark_dirty, description="Select <Modifier Interface> to target the modifier directly")
     inputs: bpy.props.CollectionProperty(type=BatchSTLInput)
 
 class BatchSTLNodeGroup(bpy.types.PropertyGroup):
-    group_name: bpy.props.StringProperty(name="Node Group", default="", update=update_with_undo("Update Node Group"))
+    group_name: bpy.props.StringProperty(name="Node Group", default="", update=mark_dirty)
     nodes: bpy.props.CollectionProperty(type=BatchSTLNode)
 
 class BatchSTLObject(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
-    export: bpy.props.BoolProperty(default=True, update=update_with_undo("Toggle Object Export"))
-    tag: bpy.props.StringProperty(name="Tag", default="", update=update_with_undo("Update Object Tag"))
-    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=update_with_undo("Update Object Sub-folder"))
+    export: bpy.props.BoolProperty(default=True, update=mark_dirty)
+    tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
+    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=mark_dirty)
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
 class BatchSTLCollection(bpy.types.PropertyGroup):
-    collection_name: bpy.props.StringProperty(name="Collection", default="", update=update_with_undo("Update Collection Name"))
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, update=update_with_undo("Toggle Collection Tag"))
-    tag: bpy.props.StringProperty(name="Tag", default="", update=update_with_undo("Update Collection Tag"))
-    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=update_with_undo("Update Collection Sub-folder"))
+    collection_name: bpy.props.StringProperty(name="Collection", default="", update=mark_dirty)
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, update=mark_dirty)
+    tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
+    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=mark_dirty)
     objects: bpy.props.CollectionProperty(type=BatchSTLObject)
-    object_index: bpy.props.IntProperty(default=0, update=update_with_undo("Change Object Selection"))
+    object_index: bpy.props.IntProperty(default=0, update=mark_dirty)
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", update=update_with_undo("Update Preset Name"))
-    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", update=update_with_undo("Update Preset Prefix"))
+    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", update=mark_dirty)
+    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", update=mark_dirty)
     collections: bpy.props.CollectionProperty(type=BatchSTLCollection)
-    collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=update_with_undo("Change Collection Selection"))
+    collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=mark_dirty)
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
     is_exporting: bpy.props.BoolProperty(default=False)
     cancel_export: bpy.props.BoolProperty(default=False)
@@ -1255,8 +1329,6 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
     def execute(self, context):
-        global _state
-        _state["is_importing"] = True
         before = len(context.scene.batch_stl_presets)
         try:
             with open(self.filepath, 'r', encoding="utf-8") as f:
@@ -1272,8 +1344,6 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
                 context.scene.batch_stl_presets.remove(len(context.scene.batch_stl_presets) - 1)
             self.report({'ERROR'}, f"Failed to import presets: {e}")
             return {'CANCELLED'}
-        finally:
-            _state["is_importing"] = False
         mark_dirty()
         return {'FINISHED'}
 
@@ -1290,35 +1360,33 @@ class ListActionHandler:
     """Utility class to handle standardized ADD/REMOVE/UP/DOWN/COPY/PASTE operations for UI lists."""
     @staticmethod
     def perform_action(action, lst, index, shift_pressed, clipboard_key, copy_func, paste_func, prevent_remove_active=False):
-        global _state, _clipboard
         new_index = index
-        with suppress_undo():
-            if action == 'ADD':
-                lst.add()
-                new_index = len(lst) - 1
-            elif action == 'REMOVE' and lst:
-                if not prevent_remove_active and 0 <= index < len(lst):
-                    lst.remove(index)
-                    new_index = max(0, min(index, len(lst) - 1))
-            elif action == 'UP' and 0 < index < len(lst):
-                target = 0 if shift_pressed else index - 1
-                lst.move(index, target)
-                new_index = target
-            elif action == 'DOWN' and 0 <= index < len(lst) - 1:
-                target = len(lst) - 1 if shift_pressed else index + 1
-                lst.move(index, target)
-                new_index = target
-            elif action == 'COPY' and lst and 0 <= index < len(lst):
-                _clipboard[clipboard_key] = copy_func(lst[index])
-            elif action == 'PASTE' and _clipboard.get(clipboard_key):
-                paste_func(lst.add(), _clipboard[clipboard_key])
-                new_index = len(lst) - 1
+        if action == 'ADD':
+            lst.add()
+            new_index = len(lst) - 1
+        elif action == 'REMOVE' and lst:
+            if not prevent_remove_active and 0 <= index < len(lst):
+                lst.remove(index)
+                new_index = max(0, min(index, len(lst) - 1))
+        elif action == 'UP' and 0 < index < len(lst):
+            target = 0 if shift_pressed else index - 1
+            lst.move(index, target)
+            new_index = target
+        elif action == 'DOWN' and 0 <= index < len(lst) - 1:
+            target = len(lst) - 1 if shift_pressed else index + 1
+            lst.move(index, target)
+            new_index = target
+        elif action == 'COPY' and lst and 0 <= index < len(lst):
+            _clipboard[clipboard_key] = copy_func(lst[index])
+        elif action == 'PASTE' and _clipboard.get(clipboard_key):
+            paste_func(lst.add(), _clipboard[clipboard_key])
+            new_index = len(lst) - 1
         return new_index
 
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_idname = "batch_stl.preset_actions"
     bl_label = "Preset Actions"
-    bl_options = {'REGISTER', 'INTERNAL'}
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
@@ -1345,13 +1413,9 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
         if prevent_remove:
             self.report({'WARNING'}, "Cannot remove a preset while it is actively exporting.")
         else:
-            with suppress_undo():
-                context.scene.batch_stl_preset_index = ListActionHandler.perform_action(
-                    self.action, lst, idx, self.shift_pressed, "preset", copy_preset_to_dict, paste_preset_from_dict, prevent_remove_active=prevent_remove
-                )
-            if self.action != 'COPY':
-                try: bpy.ops.ed.undo_push(message=f"Preset Action: {self.action}")
-                except Exception: pass
+            context.scene.batch_stl_preset_index = ListActionHandler.perform_action(
+                self.action, lst, idx, self.shift_pressed, "preset", copy_preset_to_dict, paste_preset_from_dict, prevent_remove_active=prevent_remove
+            )
 
         mark_dirty()
         return {'FINISHED'}
@@ -1359,7 +1423,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
 class BATCH_STL_OT_collection_actions(bpy.types.Operator):
     bl_idname = "batch_stl.collection_actions"
     bl_label = "Collection Actions"
-    bl_options = {'REGISTER', 'INTERNAL'}
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
@@ -1382,13 +1446,9 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
 
-        with suppress_undo():
-            preset.collection_index = ListActionHandler.perform_action(
-                self.action, preset.collections, preset.collection_index, self.shift_pressed, "collection", copy_collection_to_dict, paste_collection_from_dict
-            )
-        if self.action != 'COPY':
-            try: bpy.ops.ed.undo_push(message=f"Collection Action: {self.action}")
-            except Exception: pass
+        preset.collection_index = ListActionHandler.perform_action(
+            self.action, preset.collections, preset.collection_index, self.shift_pressed, "collection", copy_collection_to_dict, paste_collection_from_dict
+        )
 
         mark_dirty()
         return {'FINISHED'}
@@ -1396,7 +1456,7 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
 class BATCH_STL_OT_table_action(bpy.types.Operator):
     bl_idname = "batch_stl.table_action"
     bl_label = "Table Action"
-    bl_options = {'REGISTER', 'INTERNAL'}
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
 
     action: bpy.props.StringProperty()
     is_global: bpy.props.BoolProperty(default=False)
@@ -1534,15 +1594,11 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
 
                 if source_inputs:
                     existing = {i.name for i in node.inputs}
-                    global _state
-                    _state["is_populating"] = True
-                    try:
-                        for s_name in source_inputs:
-                            if s_name and s_name not in existing:
-                                inp = node.inputs.add()
-                                inp.name = s_name
-                                inp.values.add()
-                    finally: _state["is_populating"] = False
+                    for s_name in source_inputs:
+                        if s_name and s_name not in existing:
+                            inp = node.inputs.add()
+                            inp.name = s_name
+                            inp.values.add()
                     return
             inputs.add().values.add()
         elif self.action == 'DEL_INPUT' and 0 <= self.i_idx < len(inputs):
@@ -1592,51 +1648,42 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                         temp_inp = MockInput(inp_obj, val, is_temp=True)
                         parsed_vals = parse_sweep_values(MockOverride(target, ng_ptr, node_obj.name, [temp_inp]), temp_inp)
                         if parsed_vals:
-                            global _state
-                            _state["is_populating"] = True
-                            try:
-                                for p_idx, p_val in enumerate(parsed_vals):
-                                    v = val if p_idx == 0 else vals.add()
-                                    v.use_sweep = False
-                                    if inp_obj.override_type == 'FLOAT': v.value_float = p_val
-                                    elif inp_obj.override_type == 'INT': v.value_int = p_val
-                                    elif inp_obj.override_type == 'MENU': v.value_menu = str(p_val)
-                                    elif inp_obj.override_type == 'BOOLEAN': v.value_bool = bool(p_val)
-                                    elif inp_obj.override_type == 'STRING': v.value_string = str(p_val)
-                            finally: _state["is_populating"] = False
+                            for p_idx, p_val in enumerate(parsed_vals):
+                                v = val if p_idx == 0 else vals.add()
+                                v.use_sweep = False
+                                if inp_obj.override_type == 'FLOAT': v.value_float = p_val
+                                elif inp_obj.override_type == 'INT': v.value_int = p_val
+                                elif inp_obj.override_type == 'MENU': v.value_menu = str(p_val)
+                                elif inp_obj.override_type == 'BOOLEAN': v.value_bool = bool(p_val)
+                                elif inp_obj.override_type == 'STRING': v.value_string = str(p_val)
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
 
-        with suppress_undo():
-            try:
-                if self.action == 'TOGGLE_COLLECTION_USE_TAG':
-                    if 0 <= self.c_idx < len(preset.collections): preset.collections[self.c_idx].use_tag = not preset.collections[self.c_idx].use_tag
-                elif self.action == 'TOGGLE_OBJECT_EXPORT':
-                    active_col = get_active_collection(preset)
-                    if active_col and 0 <= self.o_idx < len(active_col.objects): active_col.objects[self.o_idx].export = not active_col.objects[self.o_idx].export
-                else:
-                    ng_list = self._resolve_context_list(context, preset)
-                    if ng_list is None: return {'CANCELLED'}
+        try:
+            if self.action == 'TOGGLE_COLLECTION_USE_TAG':
+                if 0 <= self.c_idx < len(preset.collections): preset.collections[self.c_idx].use_tag = not preset.collections[self.c_idx].use_tag
+            elif self.action == 'TOGGLE_OBJECT_EXPORT':
+                active_col = get_active_collection(preset)
+                if active_col and 0 <= self.o_idx < len(active_col.objects): active_col.objects[self.o_idx].export = not active_col.objects[self.o_idx].export
+            else:
+                ng_list = self._resolve_context_list(context, preset)
+                if ng_list is None: return {'CANCELLED'}
 
-                    if self.action == 'TOGGLE_VALUE_USE_DIR':
-                        if 0 <= self.ng_idx < len(ng_list) and 0 <= self.n_idx < len(ng_list[self.ng_idx].nodes) and 0 <= self.i_idx < len(ng_list[self.ng_idx].nodes[self.n_idx].inputs) and 0 <= self.v_idx < len(ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values):
-                            ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_dir = not ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_dir
-                    elif self.action == 'TOGGLE_VALUE_USE_TAG':
-                        if 0 <= self.ng_idx < len(ng_list) and 0 <= self.n_idx < len(ng_list[self.ng_idx].nodes) and 0 <= self.i_idx < len(ng_list[self.ng_idx].nodes[self.n_idx].inputs) and 0 <= self.v_idx < len(ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values):
-                            ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_tag = not ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx].use_tag
-                    elif 'GROUP' in self.action: self._handle_group_action(ng_list, context, preset)
-                    elif 'NODE' in self.action: self._handle_node_action(ng_list)
-                    elif 'INPUT' in self.action: self._handle_input_action(ng_list)
-                    elif 'VALUE' in self.action: self._handle_value_action(ng_list)
-            except IndexError:
-                self.report({'WARNING'}, "UI Sync Error: List mutated unexpectedly. Please try again.")
-                return {'CANCELLED'}
+                if self.action in ('TOGGLE_VALUE_USE_DIR', 'TOGGLE_VALUE_USE_TAG'):
+                    if 0 <= self.ng_idx < len(ng_list) and 0 <= self.n_idx < len(ng_list[self.ng_idx].nodes) and 0 <= self.i_idx < len(ng_list[self.ng_idx].nodes[self.n_idx].inputs) and 0 <= self.v_idx < len(ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values):
+                        val = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx]
+                        if self.action == 'TOGGLE_VALUE_USE_DIR': val.use_dir = not val.use_dir
+                        else: val.use_tag = not val.use_tag
+                elif 'GROUP' in self.action: self._handle_group_action(ng_list, context, preset)
+                elif 'NODE' in self.action: self._handle_node_action(ng_list)
+                elif 'INPUT' in self.action: self._handle_input_action(ng_list)
+                elif 'VALUE' in self.action: self._handle_value_action(ng_list)
+        except IndexError:
+            self.report({'WARNING'}, "UI Sync Error: List mutated unexpectedly. Please try again.")
+            return {'CANCELLED'}
 
-        if self.action != 'COPY_GROUP':
-            try: bpy.ops.ed.undo_push(message=f"Table Action: {self.action}")
-            except Exception: pass
         mark_dirty()
         return {'FINISHED'}
 
@@ -1686,6 +1733,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.preset_idx = self.preset_index if self.preset_index >= 0 else scene.batch_stl_preset_index
         if self.preset_idx < 0 or self.preset_idx >= len(scene.batch_stl_presets): return {"CANCELLED"}
         context.scene.batch_stl_preset_index = self.preset_idx
+        # Only valid during invoke: undo and file loads invalidate RNA pointers, so modal()/cleanup() re-resolve by index.
         self.preset = scene.batch_stl_presets[self.preset_idx]
 
         if self.preset.is_exporting: return {'CANCELLED'}
@@ -1710,8 +1758,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         for c in self.preset.collections:
             c_ptr = bpy.data.collections.get(c.collection_name)
             if not c_ptr or is_collection_excluded(bpy.context, c_ptr): continue
-            with suppress_undo():
-                sync_collection_objects(c, c_ptr)
+            sync_collection_objects(c, c_ptr)
             c_pinned_ovrs = get_flat_overrides(c.nodegroups, "COLLECTION")
             for obj_prop in c.objects:
                 if not obj_prop.export: continue
@@ -1724,6 +1771,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
         if objects_to_export_directly:
             depsgraph = bpy.context.evaluated_depsgraph_get()
+            instance_arrays = collect_instance_arrays(depsgraph, [item[2] for item in objects_to_export_directly])
             log_to_console(self.preset, f"=== STARTING NATIVE DIRECT EXPORT ({len(objects_to_export_directly)} Objects) ===")
             for c, obj_prop, bl_obj in objects_to_export_directly:
                 t_dir_start = time.perf_counter()
@@ -1734,17 +1782,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 filename = format_export_filename(bl_obj.name, obj_prop.tag, getattr(c, 'use_tag', False), c.tag)
                 filepath = os.path.join(out_dir, filename)
 
-                obj_eval = bl_obj.evaluated_get(depsgraph)
-                try: mesh = obj_eval.to_mesh()
-                except RuntimeError: mesh = None
+                num_tris = write_object_stl(filepath, bl_obj, depsgraph, instance_arrays.get(bl_obj.name_full, ()))
+                result_text = filepath if num_tris else f"SKIPPED (no geometry): {filepath}"
 
-                if mesh:
-                    try:
-                        write_fast_binary_stl(filepath, mesh, obj_eval.matrix_world, verbose=False)
-                    finally:
-                        obj_eval.to_mesh_clear()
-
-                log_to_console(self.preset, f"{self.preset.name} | {c.collection_name} | {bl_obj.name} | Permutation 1/1 | Batch 1/1\n  └─ {filepath} | {time.perf_counter() - t_dir_start:.2f} s")
+                log_to_console(self.preset, f"{self.preset.name} | {c.collection_name} | {bl_obj.name} | Permutation 1/1 | Batch 1/1\n  └─ {result_text} | {time.perf_counter() - t_dir_start:.2f} s")
 
         if not objects_needing_headless:
             self.preset.export_progress = 1.0
@@ -1752,7 +1793,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             end_msg = f"=== BATCH EXPORT COMPLETE ({self.preset.last_export_time:.4f}s) ==="
             log_to_console(self.preset, end_msg)
             self.report({'INFO'}, f"Batch Export {self.preset.name} Complete in {self.preset.last_export_time:.2f}s.")
-            for area in context.screen.areas: area.tag_redraw()
+            redraw_sidebars(context)
             self.cleanup(context)
             return {'FINISHED'}
 
@@ -1765,17 +1806,15 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True)
         with open(self.job_json, 'w', encoding="utf-8") as f: json.dump({"preset_index": self.preset_idx, "root_dir": bpy.path.abspath(scene.batch_stl_root_dir), "start_time": time.time(), "skip_direct": True}, f)
 
-        script_file = getattr(sys.modules.get(__name__), '__file__', '')
-        if script_file and script_file.endswith(('.pyc', '.pyo')):
-            script_file = script_file[:-1]
-        if not script_file or not os.path.exists(script_file):
-            script_file = os.path.join(self.temp_dir, "batch_stl_script.py")
-            with open(script_file, 'w', encoding="utf-8") as f:
-                f.write(next((text.as_string() for text in bpy.data.texts if "Fast Batch STL Exporter" in text.as_string()), ""))
+        # The worker runs this very file as a script (see the __main__ block at the bottom).
+        # --factory-startup disables Python auto-run, so mirror the user's setting to keep scripted drivers working.
+        worker_args = [bpy.app.binary_path, "--factory-startup"]
+        if context.preferences.filepaths.use_scripts_auto_execute: worker_args.append("--enable-autoexec")
+        worker_args += ["-b", self.temp_blend, "-P", __file__, "--", "--batch-stl-headless", self.job_json]
 
         try:
             sub_env = dict(os.environ, PYTHONUNBUFFERED="1")
-            self.process = subprocess.Popen([bpy.app.binary_path, "--factory-startup", "-b", self.temp_blend, "-P", script_file, "--", "--batch-stl-headless", self.job_json], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=sub_env)
+            self.process = subprocess.Popen(worker_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=sub_env)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to spawn headless Blender: {e}")
             self.cleanup(context)
@@ -1790,68 +1829,98 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.t = threading.Thread(target=enqueue_output, args=(self.process.stdout, self.q)); self.t.daemon = True; self.t.start()
 
         self.preset.is_exporting, self.preset.cancel_export, self.preset.export_progress = True, False, 0.0
-        self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
+        self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
+    def _preset(self):
+        presets = bpy.context.scene.batch_stl_presets
+        return presets[self.preset_idx] if 0 <= self.preset_idx < len(presets) else None
+
+    def _drain_output(self, preset):
+        """Process queued worker output. Returns True once the worker reported BATCH_STL_DONE."""
+        while True:
+            try: line = self.q.get_nowait().rstrip('\r\n')
+            except queue.Empty: return False
+            if line.startswith("BATCH_STL_TOTAL:"):
+                try: self.total_operations = int(line.split(":")[1])
+                except Exception: pass
+            elif line.startswith("BATCH_STL_PROGRESS:"):
+                try:
+                    self.current_op = int(line.split(":")[1])
+                    preset.export_progress = self.current_op / max(1, self.total_operations)
+                except Exception: pass
+            elif line.startswith("BATCH_STL_DONE"):
+                return True
+            elif line:
+                log_to_console(preset, line)
+
     def modal(self, context, event):
         try:
+            preset = self._preset()
+            if preset is None:  # presets were replaced underneath us (undo / file load)
+                self.cleanup(context)
+                return {'CANCELLED'}
+
             if event.type == 'Z' and event.value == 'PRESS' and (event.ctrl or event.oskey):
-                self.preset.cancel_export = True
+                preset.cancel_export = True
+                log_to_console(preset, "[!] Undo pressed: cancelling the running export.")
                 return {'RUNNING_MODAL'}
 
-            if self.preset.cancel_export:
+            if preset.cancel_export:
                 self.cleanup(context)
-                self.report({'WARNING'}, f"Export cancelled for {self.preset.name}.")
+                self.report({'WARNING'}, f"Export cancelled for {preset.name}.")
                 return {'CANCELLED'}
 
             if event.type == 'TIMER':
                 elapsed = time.perf_counter() - self.export_start_time
-                while True:
-                    try: line = self.q.get_nowait().rstrip('\r\n')
-                    except queue.Empty: break
-                    if line.startswith("BATCH_STL_TOTAL:"):
-                        try: self.total_operations = int(line.split(":")[1])
-                        except Exception: pass
-                    elif line.startswith("BATCH_STL_PROGRESS:"):
-                        try:
-                            self.current_op = int(line.split(":")[1])
-                            self.preset.export_progress = self.current_op / max(1, self.total_operations)
-                        except Exception: pass
-                    elif line.startswith("BATCH_STL_DONE"):
-                        self.cleanup(context)
-                        self.preset.last_export_time = time.perf_counter() - self.export_start_time
-                        end_msg = f"=== BATCH EXPORT COMPLETE ({self.preset.last_export_time:.4f}s) ==="
-                        log_to_console(self.preset, end_msg)
-                        self.report({'INFO'}, f"Batch Export {self.preset.name} Complete in {self.preset.last_export_time:.2f}s.")
-                        for area in context.screen.areas: area.tag_redraw()
-                        return {'FINISHED'}
-                    elif line:
-                        log_to_console(self.preset, line)
+                finished = self._drain_output(preset)
+                worker_exited = self.process.poll() is not None
+                if worker_exited and not finished:
+                    # The worker prints BATCH_STL_DONE right before exiting; let the reader thread flush before judging.
+                    self.t.join(timeout=2.0)
+                    finished = self._drain_output(preset)
 
-                if self.preset.is_exporting:
-                    self.preset.export_status = f"Obj {self.current_op}/{self.total_operations} | {elapsed:.1f}s" if (self.total_operations > 1 or self.current_op > 0) else f"Spawning Worker... ({elapsed:.1f}s)"
-
-                for area in context.screen.areas: area.tag_redraw()
-                if self.process and self.process.poll() is not None:
+                if finished:
                     self.cleanup(context)
-                    log_to_console(self.preset, f"[!] CRASH DETECTED: Worker died unexpectedly.")
-                    self.report({'ERROR'}, f"Background worker crashed for preset {self.preset.name}.")
+                    preset.last_export_time = time.perf_counter() - self.export_start_time
+                    log_to_console(preset, f"=== BATCH EXPORT COMPLETE ({preset.last_export_time:.4f}s) ===")
+                    self.report({'INFO'}, f"Batch Export {preset.name} Complete in {preset.last_export_time:.2f}s.")
+                    redraw_sidebars(context)
+                    return {'FINISHED'}
+
+                if worker_exited:
+                    exit_code = self.process.returncode
+                    self.cleanup(context)
+                    log_to_console(preset, f"[!] CRASH DETECTED: Worker exited with code {exit_code} before finishing.")
+                    self.report({'ERROR'}, f"Background worker crashed for preset {preset.name}.")
+                    redraw_sidebars(context)
                     return {'CANCELLED'}
-        except Exception as e:
+
+                preset.is_exporting = True  # an undo step may have restored the pre-export value
+                preset.export_status = f"Obj {self.current_op}/{self.total_operations} | {elapsed:.1f}s" if (self.total_operations > 1 or self.current_op > 0) else f"Spawning Worker... ({elapsed:.1f}s)"
+                redraw_sidebars(context)
+        except Exception:
+            traceback.print_exc()
             self.cleanup(context)
             self.report({'ERROR'}, "Unexpected error during batch export.")
             return {'CANCELLED'}
         return {'PASS_THROUGH'}
+
+    def cancel(self, context):
+        # Called by Blender when the modal is torn down from outside (e.g. loading another file).
+        self.cleanup(context)
 
     def cleanup(self, context=None):
         if context and getattr(self, '_timer', None):
             try: context.window_manager.event_timer_remove(self._timer)
             except Exception: pass
             self._timer = None
-        if hasattr(self, 'preset') and self.preset:
-            try: self.preset.is_exporting, self.preset.cancel_export, self.preset.export_progress, self.preset.export_status = False, False, 0.0, ""
-            except ReferenceError: pass
+        if hasattr(self, 'preset_idx'):
+            try:
+                preset = self._preset()
+                if preset: preset.is_exporting, preset.cancel_export, preset.export_progress, preset.export_status = False, False, 0.0, ""
+            except Exception: pass
         if getattr(self, 'process', None):
             try:
                 if self.process.poll() is None:
@@ -1875,7 +1944,7 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
         prop_row.enabled = not any_exporting
         prop_row.prop(item, "name", text="", emboss=False)
 
-        metrics = _ui_cache.get("preset_metrics", {}).get(item.name, {"has_ovr": False, "has_perm": False})
+        metrics = _ui_cache.get("preset_metrics", {}).get(index, {"has_ovr": False, "has_perm": False})
         icon_row = prop_row.row(align=True)
         icon_row.alignment = 'RIGHT'
         icon_row.label(text="", icon=ICONS['SWEEP'] if metrics["has_perm"] else ICONS['BLANK'])
@@ -2086,16 +2155,18 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                         elif inp.override_type in ['BOOLEAN', 'MENU']:
                             sub = c_val_prop.row(align=True); sub.active = False
                             if inp.override_type == 'BOOLEAN':
-                                sub.operator("wm.context_set_string", text="True & False")
+                                sub.label(text="True & False")
                             else:
                                 n_items = len(get_menu_switch_items(ng_ptr, node.name, inp.name)) if ng_ptr else 0
-                                sub.operator("wm.context_set_string", text=f"{n_items} values")
+                                sub.label(text=f"{n_items} values")
                     else:
                         prop_map = {'BOOLEAN': "value_bool", 'INT': "value_int", 'FLOAT': "value_float", 'STRING': "value_string", 'MENU': "value_menu"}
                         prop_name = prop_map.get(inp.override_type)
                         if prop_name:
                             kwargs = {"text": "True" if val.value_bool else "False", "toggle": True} if prop_name == "value_bool" else {"text": ""}
                             c_val_prop.prop(val, prop_name, **kwargs)
+                        else:
+                            c_val_prop.label(text="Unsupported socket type", icon=ICONS['ERROR'])
 
                     # Render Directory/Tag controls for permutations
                     is_permutation = len(inp.values) > 1 or any(getattr(v, "use_sweep", False) for v in inp.values)
@@ -2305,7 +2376,7 @@ class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
         list_box = content_col.box()
         list_box.template_list("BATCH_STL_UL_collections", "", active_preset, "collections", active_preset, "collection_index", rows=5)
 
-        p_stats = stats.get("presets", {}).get(active_preset.name, {"cols": 0, "objs": 0, "exp": 0})
+        p_stats = stats.get("presets", {}).get(scene.batch_stl_preset_index, {"cols": 0, "objs": 0, "exp": 0})
         draw_stats_table(content_col, [
             (p_stats['cols'], ICONS['COLLECTION']),
             (p_stats['objs'], ICONS['OBJECT']),
@@ -2347,7 +2418,7 @@ class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
         list_box.template_list("BATCH_STL_UL_objects", "", active_col, "objects", active_col, "object_index", rows=5)
 
         c_idx = active_preset.collection_index
-        col_key = f"{active_preset.name}_c{c_idx}"
+        col_key = (scene.batch_stl_preset_index, c_idx)
         c_stats = stats.get("cols", {}).get(col_key, {"objs": 0, "exp": 0})
         draw_stats_table(content_col, [
             (c_stats['objs'], ICONS['OBJECT']),
@@ -2363,8 +2434,6 @@ class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
 
 @persistent
 def reset_batch_stl_state(*args):
-    suppress_undo._depth = 0
-    for k in _state: _state[k] = False
     try:
         for p in bpy.context.scene.batch_stl_presets:
             p.is_exporting, p.cancel_export, p.export_progress, p.export_status = False, False, 0.0, ""
@@ -2388,10 +2457,10 @@ def register():
     for cls in classes: bpy.utils.register_class(cls)
 
     Scene = bpy.types.Scene
-    Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root", default="//", subtype="DIR_PATH", update=update_with_undo("Update Root Export Directory"))
+    Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root", default="//", subtype="DIR_PATH", update=mark_dirty)
     Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
     Scene.batch_stl_global_nodegroups = bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
-    Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, update=update_with_undo("Change Active Preset"))
+    Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, update=mark_dirty)
     Scene.batch_stl_verbose_console = bpy.props.BoolProperty(name="Verbose Console Output", default=False, options={'SKIP_SAVE'})
 
     for prop in ["batch_stl_ui_global_ovr_main", "batch_stl_ui_preset_ovr", "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr", "batch_stl_ui_global_ovr_nested", "batch_stl_ui_local_ovr_nested", "batch_stl_ui_tips"]:
@@ -2401,8 +2470,6 @@ def register():
     Scene.batch_stl_collapsed_dirs = bpy.props.StringProperty(default="[]", options={'SKIP_SAVE'})
     Scene.batch_stl_info_tab = bpy.props.EnumProperty(items=[('LOG', "Console Log", ""), ('TREE', "Tree View", "")], name="Info Tab", default='LOG', update=lambda s, c: mark_dirty(), options={'SKIP_SAVE'})
     Scene.batch_stl_info_global = bpy.props.BoolProperty(name="Global Mode", default=False, update=lambda s, c: mark_dirty(), options={'SKIP_SAVE'})
-    Scene.batch_stl_global_console_logs = bpy.props.CollectionProperty(type=BatchSTLLogLine)
-    Scene.batch_stl_global_console_index = bpy.props.IntProperty(default=0)
 
     reset_batch_stl_state(None)
     if reset_batch_stl_state not in bpy.app.handlers.load_post: bpy.app.handlers.load_post.append(reset_batch_stl_state)
@@ -2420,7 +2487,7 @@ def unregister():
         try: bpy.utils.unregister_class(cls)
         except RuntimeError: pass
 
-    props = ["batch_stl_root_dir", "batch_stl_presets", "batch_stl_preset_index", "batch_stl_global_nodegroups", "batch_stl_ui_global_ovr_main", "batch_stl_verbose_console", "batch_stl_ui_preset_ovr", "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr", "batch_stl_show_console", "batch_stl_collapsed_dirs", "batch_stl_ui_tips", "batch_stl_ui_global_ovr_nested", "batch_stl_ui_local_ovr_nested", "batch_stl_info_tab", "batch_stl_info_global", "batch_stl_global_console_logs", "batch_stl_global_console_index"]
+    props = ["batch_stl_root_dir", "batch_stl_presets", "batch_stl_preset_index", "batch_stl_global_nodegroups", "batch_stl_ui_global_ovr_main", "batch_stl_verbose_console", "batch_stl_ui_preset_ovr", "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr", "batch_stl_show_console", "batch_stl_collapsed_dirs", "batch_stl_ui_tips", "batch_stl_ui_global_ovr_nested", "batch_stl_ui_local_ovr_nested", "batch_stl_info_tab", "batch_stl_info_global"]
     for p in props:
         if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)
 

@@ -33,7 +33,7 @@
 |   Native Direct Export    |         |        Headless Worker Spawn Pipeline     |
 |                           |         |                                           |
 |  • Evaluated depsgraph    |         |  1. Save copy: wm.save_as_mainfile(copy)  |
-|  • write_fast_binary_stl  |         |  2. Write job manifest (job.json)         |
+|  • write_object_stl       |         |  2. Write job manifest (job.json)         |
 |  • Main thread sync       |         |  3. subprocess.Popen(blender -b ...)      |
 +───────────────────────────+         |  4. Modal handler / thread stdout queue   |
                                       +─────────────────────┬─────────────────────+
@@ -46,7 +46,7 @@
                                       |  • Dynamic depsgraph culling (lc.exclude) |
                                       |  • Itertools combinatorial sweep          |
                                       |  • Apply overrides -> depsgraph -> mesh   |
-                                      |  • write_fast_binary_stl                  |
+                                      |  • write_object_stl                       |
                                       |  • Revert baseline states                 |
                                       +───────────────────────────────────────────+
 ```
@@ -91,6 +91,8 @@ When generating variations for an object, overrides are gathered in hierarchical
 3. `Collection` (`collection.nodegroups`)
 4. `Object` (`object.nodegroups`)
 
+`resolve_overrides` then applies **most-specific-wins**: if a lower level defines the same socket (same target, node group, node and input name), the inherited values of higher levels for that socket are dropped. Several values on the same level remain variants. Objects are batched for the headless worker by `get_override_signature`, a fingerprint of the resolved overrides (values, sweeps, tags, folder flags and level).
+
 ---
 
 ## 4. Execution Pipelines
@@ -99,8 +101,8 @@ When generating variations for an object, overrides are gathered in hierarchical
 - **Condition**: Preset contains zero overrides across all hierarchy tiers.
 - **Mechanism**:
   - Resolves active objects across included collections.
-  - Computes evaluated geometry using `obj.evaluated_get(depsgraph).to_mesh()`.
-  - Streams geometry to disk using `write_fast_binary_stl`.
+  - Computes evaluated geometry using `obj.evaluated_get(depsgraph).to_mesh()`, plus unrealized instances found through `depsgraph.object_instances` (`collect_instance_arrays`).
+  - Streams geometry to disk using `write_object_stl`.
   - Cleans up evaluated mesh data via `to_mesh_clear()`.
 
 ### B. Headless Worker Pipeline (Process Isolation)
@@ -121,7 +123,7 @@ When generating variations for an object, overrides are gathered in hierarchical
      - **Evaluation Loop**:
        - Applies overrides via `apply_overrides`.
        - Calls `bpy.context.view_layer.update()` and fetches updated depsgraph.
-       - Writes STL files via `write_fast_binary_stl`.
+       - Writes STL files via `write_object_stl`.
      - **Restoration (`revert_overrides`)**: Re-applies baseline values and links, restores layer collection exclusion states.
   5. **Teardown**:
      - Worker exits with code 0.
@@ -131,7 +133,7 @@ When generating variations for an object, overrides are gathered in hierarchical
 
 ## 5. High-Performance Vectorized STL Writer
 
-Instead of creating intermediate text or using standard single-threaded Python file writers, `write_fast_binary_stl` implements direct binary packing:
+Instead of creating intermediate text or using standard single-threaded Python file writers, `mesh_to_stl_array` / `write_object_stl` implement direct binary packing:
 
 1. **Triangulation**: Calls `mesh.calc_loop_triangles()` to ensure valid facet indices.
 2. **Memory Extraction**:
@@ -166,8 +168,8 @@ Instead of creating intermediate text or using standard single-threaded Python f
 - **Naming Collision Detection**: Analyzes all destination paths and flags collisions when two permutations or objects resolve to the identical output file path.
 
 ### Undo Stack Protection (`suppress_undo`)
-- Custom context manager and depth counter (`_depth`) preventing undo stack pollution during internal UI list synchronizations (`sync_collection_objects`), automated socket type inferences (`infer_input_type`), and clipboard operations.
-- UI edits invoke debounced undo pushes via `update_with_undo(action_name)`.
+- Property edits made in the UI get Blender's native undo step; property `update` callbacks only call `mark_dirty()`. The list/table operators declare `'UNDO'` in `bl_options`. Internal syncs (`sync_collection_objects`, type inference) happen outside the UI edit path and push nothing.
+- The export modal never keeps an RNA pointer to the preset; it re-resolves it by index on every event because undo and file loads invalidate pointers.
 
 ---
 

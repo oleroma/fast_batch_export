@@ -12,3 +12,6 @@ license = [
 ]
 tags = ["Import-Export"]
 blender_version_min = "5.2.0"
+
+[permissions]
+files = "Write exported STL files and temporary worker files"

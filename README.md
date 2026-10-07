@@ -6,7 +6,7 @@ A high-performance batch export pipeline and parametric permutation engine for B
 
 ## Architecture & Technical Overview
 
-For in-depth architectural details, execution flowcharts, and engine design, see [ARCHITECTURE.md](worktree://d40f0dfa-9350-4398-a492-8e797a8bbb3e/ARCHITECTURE.md).
+For in-depth architectural details, execution flowcharts, and engine design, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 * **Blender Version Support:** Blender 5.2.0+ (Manifest schema v1.0.0, extension version 7.0.0).
 * **Package Format:** Blender 5.2 Extension (`blender_manifest.toml`).
@@ -19,6 +19,7 @@ For in-depth architectural details, execution flowcharts, and engine design, see
 ### 1. Vectorized Binary STL Generator
 * **NumPy Direct Memory Buffering:** Reads vertex coordinates, face indices, and loop normals directly into continuous memory buffers via `foreach_get`.
 * **Vectorized Transformations:** Transforms vertex positions and face normals using SIMD matrix arithmetic in NumPy, accounting for world matrices and negative determinant winding flips.
+* **Instances Included:** Unrealized Geometry Nodes instances are exported together with the object's own mesh.
 * **Instant Disk Streaming:** Meshes with hundreds of thousands of triangles are triangulated, evaluated, and streamed to disk in milliseconds.
 
 ### 2. Adaptive Dual-Path Execution Model
@@ -34,8 +35,9 @@ For in-depth architectural details, execution flowcharts, and engine design, see
 Define temporary parameter overrides and sweeps across an 8-tier hierarchy:
 `Global` → `Preset` → `Collection` → `Object` → `NodeGroup` → `Node` → `Input Socket` → `Value / Sweep`
 
+* **Override Semantics:** A more specific level replaces the inherited value of the same socket (an Object value replaces a Collection, Preset or Global value). Several values on the *same* level are variants and are all exported.
 * **Target Flexibility:** Target either exposed modifier interface sockets (`<Modifier Interface>`) or specific internal nodes within a Geometry Node tree.
-* **Type Auto-Detection:** Automatically inspects the node tree interface and infers socket data types (`FLOAT`, `INT`, `BOOLEAN`, `STRING`, `MENU`).
+* **Type Auto-Detection:** Automatically inspects the node tree interface and infers socket data types (`FLOAT`, `INT`, `BOOLEAN`, `STRING`, `MENU`). Other socket types (vectors, colors, objects, ...) are flagged as unsupported and block the export until removed.
 * **Menu/Enum Auto-Populate:** Searches and lists available items for Menu Switch nodes.
 
 ### 4. Parametric Sweeping & Combinatorial Engine

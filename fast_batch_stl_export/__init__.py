@@ -11,6 +11,7 @@ import os
 import json
 import time
 import itertools
+import functools
 import math
 import re
 import threading
@@ -63,6 +64,34 @@ _ui_cache = {
 
 def mark_dirty(self=None, context=None):
     _ui_cache["is_dirty"] = True
+
+# Blender gives every UI-edited property an undo step except search fields (prop_search / StringProperty(search=...)):
+# those buttons are created without UI_BUT_UNDO, so picking an item from the dropdown leaves no history entry.
+# Their update callbacks push the step themselves. Operators record their own step ('UNDO' in bl_options), so
+# property writes made while an operator runs must not push a second one.
+_operator_depth = 0
+
+def push_search_undo(label):
+    if _operator_depth: return
+    try: bpy.ops.ed.undo_push(message=label)
+    except RuntimeError: pass
+
+def search_field_update(label):
+    """Update callback for a search field: refresh the UI cache and record an undo step."""
+    def update(self, context):
+        mark_dirty()
+        push_search_undo(label)
+    return update
+
+def inside_operator(execute):
+    """Decorator for operator execute(): property updates fired by the operator itself do not push undo steps."""
+    @functools.wraps(execute)
+    def wrapper(self, context):
+        global _operator_depth
+        _operator_depth += 1
+        try: return execute(self, context)
+        finally: _operator_depth -= 1
+    return wrapper
 
 _INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -1162,8 +1191,9 @@ def run_headless_export(job_file_path):
 # === [ 3. PROPERTY GROUPS ] ===
 # ==============================================================================
 
-# Undo: Blender already records an undo step for every property edited in the UI, and the
-# operators below declare 'UNDO' in bl_options, so property updates only need to refresh the UI cache.
+# Undo: Blender records an undo step for every property edited in the UI, and the operators below declare
+# 'UNDO' in bl_options, so property updates only refresh the UI cache. The exception is search fields,
+# which push their own step (see search_field_update).
 
 class HierarchyIterator:
     """Helper to yield all active node groups in the hierarchy context."""
@@ -1207,17 +1237,20 @@ def infer_input_type(group_ptr, node_name, input_name):
             return classify_socket_type(node.inputs[input_name].type)
     return 'FLOAT'
 
+def sync_input_type(inp, scene):
+    for lvl, ng in HierarchyIterator.iterate(scene):
+        for n in ng.nodes:
+            if inp in n.inputs.values():
+                ng_ptr = bpy.data.node_groups.get(ng.group_name)
+                inp.override_type = infer_input_type(ng_ptr, n.name, inp.name)
+                for v in inp.values: v.use_sweep = False
+                return
+
 def on_input_name_update(self, context):
     mark_dirty()
-    try:
-        for lvl, ng in HierarchyIterator.iterate(context.scene):
-            for n in ng.nodes:
-                if self in n.inputs.values():
-                    ng_ptr = bpy.data.node_groups.get(ng.group_name)
-                    self.override_type = infer_input_type(ng_ptr, n.name, self.name)
-                    for v in self.values: v.use_sweep = False
-                    return
+    try: sync_input_type(self, context.scene)
     except Exception: pass
+    push_search_undo("Edit Override Input")
 
 def search_target_node_cb(self, context, edit_text):
     if not context or not getattr(context, "scene", None): return ["<Modifier Interface>"]
@@ -1252,7 +1285,7 @@ class BatchSTLValue(bpy.types.PropertyGroup):
     value_int: bpy.props.IntProperty(name="Value", default=0, update=mark_dirty)
     value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=mark_dirty)
     value_string: bpy.props.StringProperty(name="Value", default="", update=mark_dirty)
-    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=mark_dirty)
+    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=search_field_update("Edit Override Value"))
     use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=mark_dirty)
     tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
     use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=mark_dirty)
@@ -1271,11 +1304,11 @@ class BatchSTLInput(bpy.types.PropertyGroup):
     values: bpy.props.CollectionProperty(type=BatchSTLValue)
 
 class BatchSTLNode(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Target Node", default="<Modifier Interface>", search=search_target_node_cb, update=mark_dirty, description="Select <Modifier Interface> to target the modifier directly")
+    name: bpy.props.StringProperty(name="Target Node", default="<Modifier Interface>", search=search_target_node_cb, update=search_field_update("Edit Override Node"), description="Select <Modifier Interface> to target the modifier directly")
     inputs: bpy.props.CollectionProperty(type=BatchSTLInput)
 
 class BatchSTLNodeGroup(bpy.types.PropertyGroup):
-    group_name: bpy.props.StringProperty(name="Node Group", default="", update=mark_dirty)
+    group_name: bpy.props.StringProperty(name="Node Group", default="", update=search_field_update("Edit Override Node Group"))
     nodes: bpy.props.CollectionProperty(type=BatchSTLNode)
 
 class BatchSTLObject(bpy.types.PropertyGroup):
@@ -1286,7 +1319,7 @@ class BatchSTLObject(bpy.types.PropertyGroup):
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
 class BatchSTLCollection(bpy.types.PropertyGroup):
-    collection_name: bpy.props.StringProperty(name="Collection", default="", update=mark_dirty)
+    collection_name: bpy.props.StringProperty(name="Collection", default="", update=search_field_update("Edit Collection"))
     use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, update=mark_dirty)
     tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
     sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=mark_dirty)
@@ -1340,6 +1373,7 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_options = {'REGISTER'}
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+    @inside_operator
     def execute(self, context):
         before = len(context.scene.batch_stl_presets)
         try:
@@ -1417,6 +1451,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
         self.shift_pressed = event.shift
         return self.execute(context)
 
+    @inside_operator
     def execute(self, context):
         lst = context.scene.batch_stl_presets
         idx = context.scene.batch_stl_preset_index
@@ -1456,6 +1491,7 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
         self.shift_pressed = event.shift
         return self.execute(context)
 
+    @inside_operator
     def execute(self, context):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
@@ -1671,6 +1707,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                                 elif inp_obj.override_type == 'BOOLEAN': v.value_bool = bool(p_val)
                                 elif inp_obj.override_type == 'STRING': v.value_string = str(p_val)
 
+    @inside_operator
     def execute(self, context):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}

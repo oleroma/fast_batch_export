@@ -1,16 +1,16 @@
 schema_version = "1.0.0"
-id = "Combi_Export"
-version = "7.0.0"
+id = "combi_export"
+version = "1.0.0"
 name = "Combi Export"
-tagline = "export path mapping with node overrides"
-description = "Export of collections to mapped directories with geometry nodes overrides."
-maintainer = "AI"
+tagline = "stl export path mapping with node overrides and permutations"
+description = "STL Export to mapped directories with geometry nodes overrides and combinatorial generation."
+maintainer = "me & AI"
 type = "add-on"
-build_date = "2026-09-10"
+build_date = "2026-10-07"
 license = [
     "SPDX:GPL-3.0-or-later"
 ]
-tags = ["Import-Export"]
+tags = ["Import-Export", "Geometry Nodes", "3D Printing", "Pipeline"]
 blender_version_min = "5.2.0"
 
 [permissions]

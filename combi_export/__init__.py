@@ -2244,8 +2244,8 @@ def draw_overrides_table(layout, scene, nodegroups, is_collection, is_open_prop,
 class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Export"
-    bl_label = "Fast Batch STL Export"
+    bl_category = "Combi Export"
+    bl_label = "Combi Export"
 
     def draw_header(self, context):
         self.layout.label(text="", icon=ICONS['EXPORT'])
@@ -2343,7 +2343,7 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
 class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Export"
+    bl_category = "Combi Export"
     bl_label = "Presets"
 
     @classmethod
@@ -2396,7 +2396,7 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
 class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Export"
+    bl_category = "Combi Export"
     bl_label = "Collections"
 
     @classmethod
@@ -2444,7 +2444,7 @@ class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
 class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Export"
+    bl_category = "Combi Export"
     bl_label = "Objects"
 
     @classmethod

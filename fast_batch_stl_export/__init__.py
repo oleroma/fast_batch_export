@@ -59,7 +59,6 @@ _ui_cache = {
     "stats": {"global": {"presets": 0, "cols": 0, "objs": 0, "exp": 0}, "presets": {}, "cols": {}},
     "tree": ({}, set()),
     "preset_metrics": {},
-    "any_exporting": False,
 }
 
 def mark_dirty(self=None, context=None):
@@ -507,14 +506,24 @@ def get_active_collection(preset):
 def get_active_object(collection):
     return collection.objects[collection.object_index] if collection and collection.objects and 0 <= collection.object_index < len(collection.objects) else None
 
-def log_to_console(preset, text):
-    if preset:
-        log = preset.console_logs.add()
-        log.text = text
-        preset.console_index = len(preset.console_logs) - 1
-        if len(preset.console_logs) > 300:
-            preset.console_logs.remove(0)
-            preset.console_index = len(preset.console_logs) - 1
+def get_job(preset_index, create=False):
+    """Runtime export state of a preset (keyed by its index). Creating requires an operator context, not a draw call."""
+    jobs = bpy.context.window_manager.batch_stl_jobs
+    for job in jobs:
+        if job.preset_index == preset_index: return job
+    if not create: return None
+    job = jobs.add()
+    job.preset_index = preset_index
+    return job
+
+def is_any_exporting():
+    return any(job.is_exporting for job in bpy.context.window_manager.batch_stl_jobs)
+
+def log_to_console(job, text):
+    if job:
+        job.console_logs.add().text = text
+        if len(job.console_logs) > 300: job.console_logs.remove(0)
+        job.console_index = len(job.console_logs) - 1
 
 def format_export_filename(bl_obj_name, obj_tag, col_use_tag, col_tag, combo_suffix=""):
     safe_name = bpy.path.clean_name(bl_obj_name)
@@ -912,7 +921,6 @@ def rebuild_ui_cache_if_dirty():
             preset_stats[p_idx] = {"cols": p_cols, "objs": p_objs, "exp": p_exp}
 
         _ui_cache["stats"] = {"global": {"presets": total_presets, "cols": g_cols, "objs": g_objs, "exp": g_exp}, "presets": preset_stats, "cols": col_stats}
-        _ui_cache["any_exporting"] = any(p.is_exporting for p in scene.batch_stl_presets)
 
         show_console = getattr(scene, "batch_stl_show_console", False)
         info_tab = getattr(scene, "batch_stl_info_tab", 'LOG')
@@ -1286,18 +1294,22 @@ class BatchSTLCollection(bpy.types.PropertyGroup):
     object_index: bpy.props.IntProperty(default=0, update=mark_dirty)
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
-class BatchSTLExportPreset(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", update=mark_dirty)
-    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", update=mark_dirty)
-    collections: bpy.props.CollectionProperty(type=BatchSTLCollection)
-    collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=mark_dirty)
-    nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
+class BatchSTLJob(bpy.types.PropertyGroup):
+    """Runtime state of one preset's export. Lives on the WindowManager so it is never saved or rolled back by undo."""
+    preset_index: bpy.props.IntProperty(default=-1)
     is_exporting: bpy.props.BoolProperty(default=False)
     cancel_export: bpy.props.BoolProperty(default=False)
     export_progress: bpy.props.FloatProperty(name="Progress", default=0.0, min=0.0, max=1.0)
     export_status: bpy.props.StringProperty(default="")
     console_logs: bpy.props.CollectionProperty(type=BatchSTLLogLine)
     console_index: bpy.props.IntProperty(default=0)
+
+class BatchSTLExportPreset(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", update=mark_dirty)
+    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", update=mark_dirty)
+    collections: bpy.props.CollectionProperty(type=BatchSTLCollection)
+    collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=mark_dirty)
+    nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
     last_export_time: bpy.props.FloatProperty(name="Last Export Time", default=0.0)
 
 
@@ -1352,20 +1364,20 @@ class BATCH_STL_OT_clear_console(bpy.types.Operator):
     bl_label = "Clear Console"
     bl_description = "Clear console logs for the current view"
     def execute(self, context):
-        preset = get_active_preset(context.scene)
-        if preset: preset.console_logs.clear()
+        job = get_job(context.scene.batch_stl_preset_index)
+        if job: job.console_logs.clear()
         return {'FINISHED'}
 
 class ListActionHandler:
     """Utility class to handle standardized ADD/REMOVE/UP/DOWN/COPY/PASTE operations for UI lists."""
     @staticmethod
-    def perform_action(action, lst, index, shift_pressed, clipboard_key, copy_func, paste_func, prevent_remove_active=False):
+    def perform_action(action, lst, index, shift_pressed, clipboard_key, copy_func, paste_func):
         new_index = index
         if action == 'ADD':
             lst.add()
             new_index = len(lst) - 1
         elif action == 'REMOVE' and lst:
-            if not prevent_remove_active and 0 <= index < len(lst):
+            if 0 <= index < len(lst):
                 lst.remove(index)
                 new_index = max(0, min(index, len(lst) - 1))
         elif action == 'UP' and 0 < index < len(lst):
@@ -1408,14 +1420,16 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     def execute(self, context):
         lst = context.scene.batch_stl_presets
         idx = context.scene.batch_stl_preset_index
-        prevent_remove = self.action == 'REMOVE' and lst and 0 <= idx < len(lst) and lst[idx].is_exporting
+        # Export state is keyed by preset index, so removing or reordering presets is only safe while nothing runs.
+        reorders = self.action in {'REMOVE', 'UP', 'DOWN'}
 
-        if prevent_remove:
-            self.report({'WARNING'}, "Cannot remove a preset while it is actively exporting.")
+        if reorders and is_any_exporting():
+            self.report({'WARNING'}, "Cannot remove or reorder presets while an export is running.")
         else:
             context.scene.batch_stl_preset_index = ListActionHandler.perform_action(
-                self.action, lst, idx, self.shift_pressed, "preset", copy_preset_to_dict, paste_preset_from_dict, prevent_remove_active=prevent_remove
+                self.action, lst, idx, self.shift_pressed, "preset", copy_preset_to_dict, paste_preset_from_dict
             )
+            if reorders: context.window_manager.batch_stl_jobs.clear()  # old logs would point at the wrong presets
 
         mark_dirty()
         return {'FINISHED'}
@@ -1708,10 +1722,10 @@ class BATCH_STL_OT_cancel_export(bpy.types.Operator):
     bl_description = "Cancel the active batch export"
     preset_index: bpy.props.IntProperty(default=-1)
     def execute(self, context):
-        if 0 <= self.preset_index < len(context.scene.batch_stl_presets):
-            preset = context.scene.batch_stl_presets[self.preset_index]
-            preset.cancel_export = True
-            log_to_console(preset, f"[!] Export cancelled manually for '{preset.name}'.")
+        job = get_job(self.preset_index)
+        if job and job.is_exporting:
+            job.cancel_export = True
+            log_to_console(job, "[!] Export cancelled manually.")
         return {'FINISHED'}
 
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
@@ -1733,10 +1747,11 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.preset_idx = self.preset_index if self.preset_index >= 0 else scene.batch_stl_preset_index
         if self.preset_idx < 0 or self.preset_idx >= len(scene.batch_stl_presets): return {"CANCELLED"}
         context.scene.batch_stl_preset_index = self.preset_idx
-        # Only valid during invoke: undo and file loads invalidate RNA pointers, so modal()/cleanup() re-resolve by index.
+        # Pointers are only valid during invoke: undo and file loads invalidate them, so modal()/cleanup() re-resolve by index.
         self.preset = scene.batch_stl_presets[self.preset_idx]
+        job = get_job(self.preset_idx, create=True)
 
-        if self.preset.is_exporting: return {'CANCELLED'}
+        if job.is_exporting: return {'CANCELLED'}
         if not scene.batch_stl_root_dir:
             self.report({'ERROR'}, "Missing Root Directory")
             return {"CANCELLED"}
@@ -1748,7 +1763,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             return {"CANCELLED"}
 
         if context.scene.batch_stl_show_console: context.scene.batch_stl_info_tab = 'LOG'
-        self.preset.console_logs.clear()
+        job.console_logs.clear()
 
         objects_to_export_directly, objects_needing_headless = [], []
         preset_root = os.path.normpath(bpy.path.abspath(scene.batch_stl_root_dir))
@@ -1772,7 +1787,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if objects_to_export_directly:
             depsgraph = bpy.context.evaluated_depsgraph_get()
             instance_arrays = collect_instance_arrays(depsgraph, [item[2] for item in objects_to_export_directly])
-            log_to_console(self.preset, f"=== STARTING NATIVE DIRECT EXPORT ({len(objects_to_export_directly)} Objects) ===")
+            log_to_console(job, f"=== STARTING NATIVE DIRECT EXPORT ({len(objects_to_export_directly)} Objects) ===")
             for c, obj_prop, bl_obj in objects_to_export_directly:
                 t_dir_start = time.perf_counter()
                 full_dir_parts = build_export_dir_parts(self.preset.preset_prefix, c.sub_path, obj_prop.sub_path)
@@ -1785,19 +1800,17 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 num_tris = write_object_stl(filepath, bl_obj, depsgraph, instance_arrays.get(bl_obj.name_full, ()))
                 result_text = filepath if num_tris else f"SKIPPED (no geometry): {filepath}"
 
-                log_to_console(self.preset, f"{self.preset.name} | {c.collection_name} | {bl_obj.name} | Permutation 1/1 | Batch 1/1\n  └─ {result_text} | {time.perf_counter() - t_dir_start:.2f} s")
+                log_to_console(job, f"{self.preset.name} | {c.collection_name} | {bl_obj.name} | Permutation 1/1 | Batch 1/1\n  └─ {result_text} | {time.perf_counter() - t_dir_start:.2f} s")
 
         if not objects_needing_headless:
-            self.preset.export_progress = 1.0
             self.preset.last_export_time = time.perf_counter() - self.export_start_time
-            end_msg = f"=== BATCH EXPORT COMPLETE ({self.preset.last_export_time:.4f}s) ==="
-            log_to_console(self.preset, end_msg)
+            log_to_console(job, f"=== BATCH EXPORT COMPLETE ({self.preset.last_export_time:.4f}s) ===")
             self.report({'INFO'}, f"Batch Export {self.preset.name} Complete in {self.preset.last_export_time:.2f}s.")
             redraw_sidebars(context)
             self.cleanup(context)
             return {'FINISHED'}
 
-        self.preset.export_status = f"Spawning Worker... (0.0s)"
+        job.export_status = "Spawning Worker... (0.0s)"
         t_spawn_start = time.perf_counter()
         self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
         self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
@@ -1820,7 +1833,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self.cleanup(context)
             return {'CANCELLED'}
 
-        log_to_console(self.preset, f"=== INITIATING HEADLESS EXPORT '{self.preset.name}' [{time.perf_counter() - t_spawn_start:.4f}s Boot] ===")
+        log_to_console(job, f"=== INITIATING HEADLESS EXPORT '{self.preset.name}' [{time.perf_counter() - t_spawn_start:.4f}s Boot] ===")
 
         self.q = queue.Queue()
         def enqueue_output(out, q):
@@ -1828,7 +1841,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             out.close()
         self.t = threading.Thread(target=enqueue_output, args=(self.process.stdout, self.q)); self.t.daemon = True; self.t.start()
 
-        self.preset.is_exporting, self.preset.cancel_export, self.preset.export_progress = True, False, 0.0
+        job.is_exporting, job.cancel_export, job.export_progress = True, False, 0.0
         self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
@@ -1837,7 +1850,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         presets = bpy.context.scene.batch_stl_presets
         return presets[self.preset_idx] if 0 <= self.preset_idx < len(presets) else None
 
-    def _drain_output(self, preset):
+    def _job(self):
+        return get_job(self.preset_idx)
+
+    def _drain_output(self, job):
         """Process queued worker output. Returns True once the worker reported BATCH_STL_DONE."""
         while True:
             try: line = self.q.get_nowait().rstrip('\r\n')
@@ -1848,43 +1864,44 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             elif line.startswith("BATCH_STL_PROGRESS:"):
                 try:
                     self.current_op = int(line.split(":")[1])
-                    preset.export_progress = self.current_op / max(1, self.total_operations)
+                    job.export_progress = self.current_op / max(1, self.total_operations)
                 except Exception: pass
             elif line.startswith("BATCH_STL_DONE"):
                 return True
             elif line:
-                log_to_console(preset, line)
+                log_to_console(job, line)
 
     def modal(self, context, event):
         try:
-            preset = self._preset()
-            if preset is None:  # presets were replaced underneath us (undo / file load)
+            preset, job = self._preset(), self._job()
+            if preset is None or job is None:  # presets were replaced underneath us (undo / file load)
                 self.cleanup(context)
                 return {'CANCELLED'}
 
             if event.type == 'Z' and event.value == 'PRESS' and (event.ctrl or event.oskey):
-                preset.cancel_export = True
-                log_to_console(preset, "[!] Undo pressed: cancelling the running export.")
+                # Undo could shift preset indices, which the running job is keyed by.
+                job.cancel_export = True
+                log_to_console(job, "[!] Undo pressed: cancelling the running export.")
                 return {'RUNNING_MODAL'}
 
-            if preset.cancel_export:
+            if job.cancel_export:
                 self.cleanup(context)
                 self.report({'WARNING'}, f"Export cancelled for {preset.name}.")
                 return {'CANCELLED'}
 
             if event.type == 'TIMER':
                 elapsed = time.perf_counter() - self.export_start_time
-                finished = self._drain_output(preset)
+                finished = self._drain_output(job)
                 worker_exited = self.process.poll() is not None
                 if worker_exited and not finished:
                     # The worker prints BATCH_STL_DONE right before exiting; let the reader thread flush before judging.
                     self.t.join(timeout=2.0)
-                    finished = self._drain_output(preset)
+                    finished = self._drain_output(job)
 
                 if finished:
                     self.cleanup(context)
                     preset.last_export_time = time.perf_counter() - self.export_start_time
-                    log_to_console(preset, f"=== BATCH EXPORT COMPLETE ({preset.last_export_time:.4f}s) ===")
+                    log_to_console(job, f"=== BATCH EXPORT COMPLETE ({preset.last_export_time:.4f}s) ===")
                     self.report({'INFO'}, f"Batch Export {preset.name} Complete in {preset.last_export_time:.2f}s.")
                     redraw_sidebars(context)
                     return {'FINISHED'}
@@ -1892,13 +1909,12 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 if worker_exited:
                     exit_code = self.process.returncode
                     self.cleanup(context)
-                    log_to_console(preset, f"[!] CRASH DETECTED: Worker exited with code {exit_code} before finishing.")
+                    log_to_console(job, f"[!] CRASH DETECTED: Worker exited with code {exit_code} before finishing.")
                     self.report({'ERROR'}, f"Background worker crashed for preset {preset.name}.")
                     redraw_sidebars(context)
                     return {'CANCELLED'}
 
-                preset.is_exporting = True  # an undo step may have restored the pre-export value
-                preset.export_status = f"Obj {self.current_op}/{self.total_operations} | {elapsed:.1f}s" if (self.total_operations > 1 or self.current_op > 0) else f"Spawning Worker... ({elapsed:.1f}s)"
+                job.export_status = f"Obj {self.current_op}/{self.total_operations} | {elapsed:.1f}s" if (self.total_operations > 1 or self.current_op > 0) else f"Spawning Worker... ({elapsed:.1f}s)"
                 redraw_sidebars(context)
         except Exception:
             traceback.print_exc()
@@ -1918,8 +1934,8 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self._timer = None
         if hasattr(self, 'preset_idx'):
             try:
-                preset = self._preset()
-                if preset: preset.is_exporting, preset.cancel_export, preset.export_progress, preset.export_status = False, False, 0.0, ""
+                job = self._job()
+                if job: job.is_exporting, job.cancel_export, job.export_progress, job.export_status = False, False, 0.0, ""
             except Exception: pass
         if getattr(self, 'process', None):
             try:
@@ -1938,10 +1954,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
 class BATCH_STL_UL_presets(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        any_exporting = _ui_cache.get("any_exporting", False)
+        job = get_job(index)
         row = layout.row(align=True)
         prop_row = row.row(align=True)
-        prop_row.enabled = not any_exporting
+        prop_row.enabled = not is_any_exporting()
         prop_row.prop(item, "name", text="", emboss=False)
 
         metrics = _ui_cache.get("preset_metrics", {}).get(index, {"has_ovr": False, "has_perm": False})
@@ -1951,8 +1967,8 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
         icon_row.label(text="", icon=ICONS['NODE'] if metrics["has_ovr"] else ICONS['BLANK'])
         prop_row.prop(item, "preset_prefix", text="", emboss=False, icon=ICONS['DIR'])
 
-        if item.is_exporting:
-            row.prop(item, "export_progress", text=item.export_status, slider=True)
+        if job and job.is_exporting:
+            row.prop(job, "export_progress", text=job.export_status, slider=True)
             row.operator("batch_stl.cancel_export", text="", icon=ICONS['CANCEL']).preset_index = index
         else:
             row.operator("export_scene.batch_stl_multi", text="", icon=ICONS['EXPORT']).preset_index = index
@@ -2200,7 +2216,7 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
     def draw_header_preset(self, context):
         layout = self.layout
         scene = context.scene
-        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+        any_exporting = is_any_exporting()
 
         row = layout.row(align=True)
         sub_row = row.row(align=True)
@@ -2214,7 +2230,7 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
 
-        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+        any_exporting = is_any_exporting()
 
         dir_col = layout.column()
         dir_col.enabled = not any_exporting
@@ -2230,13 +2246,14 @@ class VIEW3D_PT_batch_export_stl_main(bpy.types.Panel):
             tab_row.prop(scene, "batch_stl_info_tab", expand=True)
 
             if scene.batch_stl_info_tab == 'LOG':
-                if active_preset:
-                    info_box.template_list("BATCH_STL_UL_console_logs", "", active_preset, "console_logs", active_preset, "console_index", rows=6)
+                active_job = get_job(scene.batch_stl_preset_index)
+                if active_job:
+                    info_box.template_list("BATCH_STL_UL_console_logs", "", active_job, "console_logs", active_job, "console_index", rows=6)
                     clear_col = info_box.column()
                     clear_col.enabled = not any_exporting
                     clear_col.operator("batch_stl.clear_console", text="Clear Log", icon=ICONS['DEL'])
                 else:
-                    info_box.label(text="Select a preset to view logs.", icon=ICONS['INFO'])
+                    info_box.label(text="No export log for this preset yet.", icon=ICONS['INFO'])
                 info_box.prop(scene, "batch_stl_verbose_console", toggle=True, icon=ICONS['CONSOLE'])
 
             elif scene.batch_stl_info_tab == 'TREE':
@@ -2302,7 +2319,7 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
     def draw_header_preset(self, context):
         layout = self.layout
         scene = context.scene
-        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+        any_exporting = is_any_exporting()
         active_preset = get_active_preset(scene)
 
         row = layout.row(align=True)
@@ -2316,7 +2333,7 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+        any_exporting = is_any_exporting()
         active_preset = get_active_preset(scene)
         stats = _ui_cache.get("stats", {})
 
@@ -2336,7 +2353,7 @@ class VIEW3D_PT_batch_export_stl_presets(bpy.types.Panel):
         ])
 
         if active_preset:
-            draw_overrides_table(locked_col, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ]", is_preset=True, is_locked=active_preset.is_exporting)
+            draw_overrides_table(locked_col, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Overrides for [ {active_preset.name} ]", is_preset=True, is_locked=any_exporting)
 
 
 class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
@@ -2355,7 +2372,7 @@ class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
     def draw_header_preset(self, context):
         layout = self.layout
         scene = context.scene
-        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+        any_exporting = is_any_exporting()
 
         row = layout.row(align=True)
         row.enabled = not any_exporting
@@ -2365,7 +2382,7 @@ class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+        any_exporting = is_any_exporting()
         active_preset = get_active_preset(scene)
         stats = _ui_cache.get("stats", {})
 
@@ -2384,7 +2401,7 @@ class VIEW3D_PT_batch_export_stl_collections(bpy.types.Panel):
         ])
 
         if active_col:
-            draw_overrides_table(content_col, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Overrides [ {active_col.collection_name or 'Shared'} ]", is_locked=active_preset.is_exporting)
+            draw_overrides_table(content_col, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Overrides [ {active_col.collection_name or 'Shared'} ]", is_locked=any_exporting)
 
 
 class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
@@ -2405,7 +2422,7 @@ class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+        any_exporting = is_any_exporting()
         active_preset = get_active_preset(scene)
         stats = _ui_cache.get("stats", {})
 
@@ -2426,7 +2443,7 @@ class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
         ])
 
         if active_obj:
-            draw_overrides_table(content_col, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Overrides [ {active_obj.name} ]", is_locked=active_preset.is_exporting)
+            draw_overrides_table(content_col, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Overrides [ {active_obj.name} ]", is_locked=any_exporting)
 
 # ==============================================================================
 # === [ 6. REGISTRATION & LIFECYCLE ] ===
@@ -2435,15 +2452,14 @@ class VIEW3D_PT_batch_export_stl_objects(bpy.types.Panel):
 @persistent
 def reset_batch_stl_state(*args):
     try:
-        for p in bpy.context.scene.batch_stl_presets:
-            p.is_exporting, p.cancel_export, p.export_progress, p.export_status = False, False, 0.0, ""
+        for wm in bpy.data.window_managers: wm.batch_stl_jobs.clear()  # no export survives a file load
     except Exception: pass
     mark_dirty()
     if "--batch-stl-headless" not in sys.argv and not bpy.app.timers.is_registered(rebuild_ui_cache_if_dirty):
         bpy.app.timers.register(rebuild_ui_cache_if_dirty)
 
 classes = (
-    BatchSTLLogLine, BatchSTLValue, BatchSTLInput, BatchSTLNode, BatchSTLNodeGroup, BatchSTLObject, BatchSTLCollection, BatchSTLExportPreset,
+    BatchSTLLogLine, BatchSTLJob, BatchSTLValue, BatchSTLInput, BatchSTLNode, BatchSTLNodeGroup, BatchSTLObject, BatchSTLCollection, BatchSTLExportPreset,
     BATCH_STL_UL_presets, BATCH_STL_UL_collections, BATCH_STL_UL_objects, BATCH_STL_UL_console_logs,
     BATCH_STL_OT_clear_console, BATCH_STL_OT_preset_actions, BATCH_STL_OT_collection_actions, BATCH_STL_OT_table_action, BATCH_STL_OT_toggle_dir_tree, BATCH_STL_OT_cancel_export, BATCH_STL_OT_export_presets_json, BATCH_STL_OT_import_presets_json, EXPORT_OT_batch_stl_multi,
     VIEW3D_PT_batch_export_stl_main, VIEW3D_PT_batch_export_stl_presets, VIEW3D_PT_batch_export_stl_collections, VIEW3D_PT_batch_export_stl_objects
@@ -2455,6 +2471,8 @@ def update_show_console(self, context):
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)
+
+    bpy.types.WindowManager.batch_stl_jobs = bpy.props.CollectionProperty(type=BatchSTLJob)
 
     Scene = bpy.types.Scene
     Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root", default="//", subtype="DIR_PATH", update=mark_dirty)
@@ -2486,6 +2504,8 @@ def unregister():
     for cls in reversed(classes):
         try: bpy.utils.unregister_class(cls)
         except RuntimeError: pass
+
+    if hasattr(bpy.types.WindowManager, "batch_stl_jobs"): del bpy.types.WindowManager.batch_stl_jobs
 
     props = ["batch_stl_root_dir", "batch_stl_presets", "batch_stl_preset_index", "batch_stl_global_nodegroups", "batch_stl_ui_global_ovr_main", "batch_stl_verbose_console", "batch_stl_ui_preset_ovr", "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr", "batch_stl_show_console", "batch_stl_collapsed_dirs", "batch_stl_ui_tips", "batch_stl_ui_global_ovr_nested", "batch_stl_ui_local_ovr_nested", "batch_stl_info_tab", "batch_stl_info_global"]
     for p in props:

@@ -167,9 +167,11 @@ Instead of creating intermediate text or using standard single-threaded Python f
 - Computes directory hierarchies and leaf files in advance.
 - **Naming Collision Detection**: Analyzes all destination paths and flags collisions when two permutations or objects resolve to the identical output file path.
 
-### Undo Stack Protection (`suppress_undo`)
+### Undo Stack Protection
 - Property edits made in the UI get Blender's native undo step; property `update` callbacks only call `mark_dirty()`. The list/table operators declare `'UNDO'` in `bl_options`. Internal syncs (`sync_collection_objects`, type inference) happen outside the UI edit path and push nothing.
-- The export modal never keeps an RNA pointer to the preset; it re-resolves it by index on every event because undo and file loads invalidate pointers.
+- Runtime export state (`is_exporting`, progress, status, cancel flag, console log) lives in `WindowManager.batch_stl_jobs` (`BatchSTLJob`, one entry per preset index), not on the Scene. It is therefore never saved in the `.blend` and never rolled back by undo; `load_post` clears it. Entries are created by operators (`get_job(..., create=True)`); draw code only reads them.
+- Jobs are keyed by preset index, so removing/reordering presets is refused while any export runs. Pressing undo during an export cancels it for the same reason.
+- The export modal never keeps an RNA pointer to a preset or job; it re-resolves them by index on every event because undo, file loads and collection growth invalidate pointers.
 
 ---
 

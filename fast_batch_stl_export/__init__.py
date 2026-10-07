@@ -1398,7 +1398,7 @@ class ListActionHandler:
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_idname = "batch_stl.preset_actions"
     bl_label = "Preset Actions"
-    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+    bl_options = {'UNDO', 'INTERNAL'}  # no REGISTER: hides the "Adjust Last Operation" redo panel
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
@@ -1437,7 +1437,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
 class BATCH_STL_OT_collection_actions(bpy.types.Operator):
     bl_idname = "batch_stl.collection_actions"
     bl_label = "Collection Actions"
-    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+    bl_options = {'UNDO', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
@@ -1470,12 +1470,12 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
 class BATCH_STL_OT_table_action(bpy.types.Operator):
     bl_idname = "batch_stl.table_action"
     bl_label = "Table Action"
-    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+    bl_options = {'UNDO', 'INTERNAL'}
 
     action: bpy.props.StringProperty()
     is_global: bpy.props.BoolProperty(default=False)
     is_preset: bpy.props.BoolProperty(default=False)
-    is_pinned: bpy.props.BoolProperty()
+    is_collection: bpy.props.BoolProperty()
     c_idx: bpy.props.IntProperty(default=-1)
     o_idx: bpy.props.IntProperty(default=-1)
     ng_idx: bpy.props.IntProperty(default=-1)
@@ -1523,7 +1523,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
 
         active_col = get_active_collection(preset)
         if not active_col: return None
-        if self.is_pinned: return active_col.nodegroups
+        if self.is_collection: return active_col.nodegroups
 
         active_obj = get_active_object(active_col)
         return active_obj.nodegroups if active_obj else None
@@ -1545,7 +1545,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                 src_ng = ng_list[self.ng_idx]
                 dst = None
                 if self.is_preset: dst = context.scene.batch_stl_global_nodegroups
-                elif self.is_pinned: dst = preset.nodegroups
+                elif self.is_collection: dst = preset.nodegroups
                 elif not self.is_global:
                     col = get_active_collection(preset)
                     dst = col.nodegroups if col else None
@@ -1566,7 +1566,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                     for c in preset.collections:
                         paste_ng_from_dict(c.nodegroups.add(), copied_data)
                         pushed = True
-                elif self.is_pinned:
+                elif self.is_collection:
                     col = get_active_collection(preset)
                     if col:
                         for o in col.objects:
@@ -2022,11 +2022,11 @@ def draw_stats_table(parent_layout, stats_list):
         if i > 0: row.separator(factor=2.0)
         row.label(text=str(val), icon=icon)
 
-def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text, is_preset=False, is_global=False, is_locked=False):
+def draw_overrides_table(layout, scene, nodegroups, is_collection, is_open_prop, title_text, is_preset=False, is_global=False, is_locked=False):
     # Setup inline helper to simplify conditional operator generation drastically
     def draw_op(parent, action, icon, depress=False, ng_idx=-1, n_idx=-1, i_idx=-1, v_idx=-1):
         op = parent.operator("batch_stl.table_action", text="", icon=icon, depress=depress)
-        op.action, op.is_pinned, op.is_preset, op.is_global = action, is_pinned, is_preset, is_global
+        op.action, op.is_collection, op.is_preset, op.is_global = action, is_collection, is_preset, is_global
         op.ng_idx, op.n_idx, op.i_idx, op.v_idx = ng_idx, n_idx, i_idx, v_idx
         return op
 
@@ -2053,7 +2053,7 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
     icon_open = ICONS['DOWN'] if is_open else ICONS['RIGHT']
     header_row.prop(scene, is_open_prop, text="", icon=icon_open, emboss=False)
 
-    icon_header = ICONS['GLOBAL'] if is_global else (ICONS['PRESET'] if is_preset else (ICONS['COLLECTION'] if is_pinned else ICONS['OBJECT']))
+    icon_header = ICONS['GLOBAL'] if is_global else (ICONS['PRESET'] if is_preset else (ICONS['COLLECTION'] if is_collection else ICONS['OBJECT']))
     header_row.label(text="", icon=ICONS['OVR'])
     header_row.label(text=title_text, icon=icon_header)
 

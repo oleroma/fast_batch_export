@@ -1853,7 +1853,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
         self.job_json = os.path.join(self.temp_dir, "job.json")
 
-        bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True)
+        bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True, compress=False)
         with open(self.job_json, 'w', encoding="utf-8") as f: json.dump({"preset_index": self.preset_idx, "root_dir": bpy.path.abspath(scene.batch_stl_root_dir), "start_time": time.time(), "skip_direct": True}, f)
 
         # The worker runs this very file as a script (see the __main__ block at the bottom).
